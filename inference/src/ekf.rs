@@ -85,8 +85,8 @@ impl PoseEkf {
         let z = DVector::from_column_slice(measurement);
 
         if !self.initialized {
-            for i in 0..self.num_dims {
-                self.x[3 * i] = measurement[i];
+            for (i, &m) in measurement.iter().enumerate().take(self.num_dims) {
+                self.x[3 * i] = m;
             }
             self.initialized = true;
             self.last_time = Some(timestamp);
@@ -135,5 +135,92 @@ impl PoseEkf {
             accelerations: acc,
             timestamp,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new() {
+        let ekf = PoseEkf::new(2, 1.0 / 60.0, 10.0, 0.01);
+        // State dimension should be 3 * num_dims = 6
+        assert_eq!(ekf.state_dim, 6);
+        assert_eq!(ekf.num_dims, 2);
+        // Initial state vector should be all zeros
+        for i in 0..6 {
+            assert_eq!(ekf.x[i], 0.0);
+        }
+        assert!(!ekf.initialized);
+    }
+
+    #[test]
+    fn test_single_update() {
+        let mut ekf = PoseEkf::new(2, 1.0 / 60.0, 10.0, 0.01);
+        let state = ekf.update(&[3.0, -1.5], 0.0);
+        // First update initializes positions to the measurement
+        assert!((state.positions[0] - 3.0).abs() < 1e-9);
+        assert!((state.positions[1] - (-1.5)).abs() < 1e-9);
+        // Velocities and accelerations should be zero after first update
+        assert_eq!(state.velocities[0], 0.0);
+        assert_eq!(state.velocities[1], 0.0);
+        assert_eq!(state.accelerations[0], 0.0);
+        assert_eq!(state.accelerations[1], 0.0);
+    }
+
+    #[test]
+    fn test_convergence() {
+        let mut ekf = PoseEkf::new(1, 1.0 / 60.0, 10.0, 0.01);
+        let target = 5.0;
+        let mut state = ekf.update(&[target], 0.0);
+        for i in 1..=10 {
+            state = ekf.update(&[target], i as f64 / 60.0);
+        }
+        // After 10 constant measurements, position should converge close to target
+        assert!(
+            (state.positions[0] - target).abs() < 0.1,
+            "Position {} did not converge to {}",
+            state.positions[0],
+            target
+        );
+        // Velocity should be near zero for constant input
+        assert!(
+            state.velocities[0].abs() < 1.0,
+            "Velocity {} should be near zero",
+            state.velocities[0]
+        );
+    }
+
+    #[test]
+    fn test_velocity_detection() {
+        let mut ekf = PoseEkf::new(1, 1.0 / 60.0, 10.0, 0.01);
+        // Feed linearly increasing values: 0, 1, 2, ..., 20
+        let mut state = ekf.update(&[0.0], 0.0);
+        for i in 1..=20 {
+            state = ekf.update(&[i as f64], i as f64 / 60.0);
+        }
+        // Velocity should be positive since values are increasing
+        assert!(
+            state.velocities[0] > 0.0,
+            "Velocity {} should be positive for increasing input",
+            state.velocities[0]
+        );
+    }
+
+    #[test]
+    fn test_variable_dt() {
+        let mut ekf = PoseEkf::new(2, 1.0 / 60.0, 10.0, 0.01);
+        // Feed with varying timestamps — should not panic
+        let timestamps = [0.0, 0.01, 0.05, 0.06, 0.1, 0.5, 1.0];
+        for (i, &t) in timestamps.iter().enumerate() {
+            let val = i as f64;
+            let _state = ekf.update(&[val, -val], t);
+        }
+        // If we got here without panicking, the test passes.
+        // Also verify we get a reasonable result
+        let state = ekf.update(&[10.0, -10.0], 2.0);
+        assert!(state.positions[0].is_finite());
+        assert!(state.positions[1].is_finite());
     }
 }

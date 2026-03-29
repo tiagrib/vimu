@@ -1,3 +1,4 @@
+#[cfg(feature = "camera")]
 mod camera;
 mod ekf;
 mod model;
@@ -60,5 +61,20 @@ fn main() -> Result<()> {
         display: cli.display,
     };
 
-    pipeline::run(config)
+    #[cfg(feature = "camera")]
+    {
+        pipeline::run(config)?;
+    }
+
+    #[cfg(not(feature = "camera"))]
+    {
+        let _ = config;
+        anyhow::bail!(
+            "Built without the 'camera' feature. \
+             Rebuild with `cargo build --features camera` to enable the inference pipeline."
+        );
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
 }

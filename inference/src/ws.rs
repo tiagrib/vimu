@@ -1,6 +1,5 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::accept_async;

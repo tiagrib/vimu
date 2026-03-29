@@ -1,10 +1,17 @@
+#[cfg(feature = "camera")]
 use anyhow::Result;
 use serde::Serialize;
+
+#[cfg(feature = "camera")]
 use std::time::Instant;
 
+#[cfg(feature = "camera")]
 use crate::camera::Camera;
+#[cfg(feature = "camera")]
 use crate::ekf::PoseEkf;
+#[cfg(feature = "camera")]
 use crate::model::Model;
+#[cfg(feature = "camera")]
 use crate::ws::WsServer;
 
 pub struct Config {
@@ -20,31 +27,32 @@ pub struct Config {
 
 /// WebSocket message payload — one per frame.
 #[derive(Serialize)]
-struct StateMessage {
+pub(crate) struct StateMessage {
     /// Seconds since inference started
-    timestamp: f64,
+    pub timestamp: f64,
     /// Measured FPS
-    fps: f64,
+    pub fps: f64,
     /// Per-dimension state estimates
-    dims: Vec<DimState>,
+    pub dims: Vec<DimState>,
 }
 
 #[derive(Serialize)]
-struct DimState {
-    name: String,
+pub(crate) struct DimState {
+    pub name: String,
     /// Raw model output (unfiltered)
-    raw: f64,
+    pub raw: f64,
     /// EKF-filtered position
-    position: f64,
+    pub position: f64,
     /// EKF-estimated velocity
-    velocity: f64,
+    pub velocity: f64,
     /// EKF-estimated acceleration
-    acceleration: f64,
+    pub acceleration: f64,
 }
 
+#[cfg(feature = "camera")]
 pub fn run(config: Config) -> Result<()> {
     // Load model
-    let model = Model::load(&config.model_path, &config.meta_path)?;
+    let mut model = Model::load(&config.model_path, &config.meta_path)?;
     let dim_names = model.meta.outputs.clone();
     let num_dims = model.meta.output_dim;
 
@@ -147,6 +155,7 @@ pub fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "camera")]
 fn show_preview(
     frame: &opencv::core::Mat,
     names: &[String],
@@ -179,4 +188,70 @@ fn show_preview(
 
     opencv::highgui::imshow("VIMU", &display)?;
     Ok(opencv::highgui::wait_key(1)? == 'q' as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dim_state_serialization() {
+        let dim = DimState {
+            name: "yaw".to_string(),
+            raw: 1.5,
+            position: 1.4,
+            velocity: 0.1,
+            acceleration: -0.02,
+        };
+        let json = serde_json::to_value(&dim).unwrap();
+        assert_eq!(json["name"], "yaw");
+        assert_eq!(json["raw"], 1.5);
+        assert_eq!(json["position"], 1.4);
+        assert_eq!(json["velocity"], 0.1);
+        assert_eq!(json["acceleration"], -0.02);
+    }
+
+    #[test]
+    fn test_state_message_serialization() {
+        let msg = StateMessage {
+            timestamp: 1.23,
+            fps: 59.8,
+            dims: vec![
+                DimState {
+                    name: "x".to_string(),
+                    raw: 0.5,
+                    position: 0.48,
+                    velocity: 0.02,
+                    acceleration: 0.001,
+                },
+                DimState {
+                    name: "y".to_string(),
+                    raw: -0.3,
+                    position: -0.28,
+                    velocity: -0.01,
+                    acceleration: 0.0,
+                },
+            ],
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+
+        // Top-level fields
+        assert_eq!(json["timestamp"], 1.23);
+        assert_eq!(json["fps"], 59.8);
+
+        // dims is an array
+        let dims = json["dims"].as_array().unwrap();
+        assert_eq!(dims.len(), 2);
+        assert_eq!(dims[0]["name"], "x");
+        assert_eq!(dims[1]["name"], "y");
+
+        // Verify all expected fields are present in each dim
+        for dim in dims {
+            assert!(dim.get("name").is_some());
+            assert!(dim.get("raw").is_some());
+            assert!(dim.get("position").is_some());
+            assert!(dim.get("velocity").is_some());
+            assert!(dim.get("acceleration").is_some());
+        }
+    }
 }

@@ -1,0 +1,9 @@
+{
+  "terminal.integrated.env.windows": {
+    "LIBCLANG_PATH": "C:\\Users\\tiagr\\OneDrive\\Documentos\\LLVM\\bin",
+    "OPENCV_LINK_PATHS": "C:\\opencv\\opencv\\build\\x64\\vc16\\lib",
+    "OPENCV_INCLUDE_PATHS": "C:\\opencv\\opencv\\build\\include",
+    "OPENCV_LINK_LIBS": "opencv_world4100",
+    "PATH": "${env:PATH};C:\\Users\\tiagr\\.cargo\\bin;C:\\Users\\tiagr\\OneDrive\\Documentos\\LLVM\\bin;C:\\opencv\\opencv\\build\\x64\\vc16\\bin"
+  }
+}

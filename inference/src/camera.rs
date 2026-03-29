@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use opencv::{
-    core::{Mat, Size, CV_8UC3},
+    core::{Mat, Size},
     imgproc,
     prelude::*,
     videoio,

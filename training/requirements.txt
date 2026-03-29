@@ -1,0 +1,9 @@
+torch>=2.0
+torchvision>=0.15
+opencv-python>=4.8
+pandas>=2.0
+numpy>=1.24
+onnx>=1.14
+onnxruntime>=1.16
+pyserial>=3.5
+pytest>=7.0

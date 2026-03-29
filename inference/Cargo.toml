@@ -3,13 +3,17 @@ name = "vimu"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+camera = ["dep:opencv"]
+
 [dependencies]
 # ONNX Runtime with CUDA
-ort = { version = "2", features = ["cuda"] }
-ndarray = "0.16"
+ort = { version = "2.0.0-rc.12", features = ["cuda"] }
+ndarray = "0.17"
 
-# Camera
-opencv = { version = "0.93", features = ["videoio", "imgproc", "highgui"] }
+# Camera (optional — requires OpenCV dev libraries)
+opencv = { version = "0.98", features = ["videoio", "imgproc", "highgui"], optional = true }
 
 # WebSocket server
 tokio = { version = "1", features = ["full"] }
