@@ -1,15 +1,4 @@
-# Project Custom Instructions
-
-<!--
-  Add your project-wide custom instructions here.
-  This file is yours — `metak install --force` will never overwrite it.
-
-  Use this for standing rules that apply to ALL agents (orchestrator + workers):
-  - Tech stack preferences (e.g., "Use TypeScript strict mode everywhere")
-  - Deployment targets and constraints (e.g., "All services deploy to AWS ECS")
-  - Team conventions not captured in coding-standards.md
-  - Domain context that agents need to keep in mind
--->
+# VIMU — Project Custom Instructions
 
 For python use pyenv-venv-win to manage virtual environments. Always create a new virtual environment for each project and activate it before installing dependencies. This helps to avoid conflicts between different projects and ensures that each project has its own isolated environment.
 
@@ -32,3 +21,24 @@ The command to create a new virtual environment in pyenv-venv is:
 The command to activate a virtual environment in pyenv-venv is:
 ```pyenv-venv activate <env-name>
 ```
+
+## Architecture
+
+VIMU is a standalone vision-based proprioception library. It must NOT depend on nuttymoves or adelino.
+
+Three components:
+- `training/` — Python: data collection, model training, ONNX export
+- `inference/` — Rust: real-time ONNX inference + EKF + WebSocket broadcast
+- `arduino/` — Arduino firmware for standalone data collection (legacy, not needed when using nuttymoves controller)
+
+## Integration Points
+
+- `training/collect.py` has an abstract `RobotController` interface with two backends:
+  - `WebSocketController` — talks to any WebSocket controller (e.g., nuttymoves' adelino-standalone)
+  - `SerialController` — direct serial to VIMU's own Arduino firmware
+- `inference/` broadcasts state via WebSocket. Message format is in `../metak-shared/api-contracts/vimu-websocket.md`.
+
+## Testing
+
+- Python: `cd training && pytest`
+- Rust: `cd inference && cargo test`
