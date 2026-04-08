@@ -1,5 +1,6 @@
 #[cfg(feature = "camera")]
 mod camera;
+mod display;
 mod ekf;
 mod model;
 mod pipeline;

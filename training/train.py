@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
 from model import VimuModel
-from dataset import VimuDataset, get_train_transforms, get_val_transforms
+from dataset import VimuDataset, get_train_transforms, get_val_transforms, get_synthetic_transforms
 
 
 def masked_mse(pred, target, mask=None):
@@ -94,14 +94,40 @@ def main():
     parser.add_argument("--output-dir", default="./checkpoints")
     parser.add_argument("--joint-weight", type=float, default=1.0)
     parser.add_argument("--base-weight", type=float, default=0.5)
+    parser.add_argument("--mode", choices=["train", "pretrain", "finetune"], default="train",
+                        help="Training mode: train (default), pretrain (synthetic), finetune (real + pretrained)")
+    parser.add_argument("--pretrained-checkpoint", type=str, default=None,
+                        help="Path to pretrained checkpoint for finetune mode")
     args = parser.parse_args()
+
+    # Mode validation
+    if args.mode == "finetune" and not args.pretrained_checkpoint:
+        parser.error("--pretrained-checkpoint required for finetune mode")
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # Mode-specific configuration
+    if args.mode == "pretrain":
+        print("=== PRETRAIN MODE: synthetic data, full model unfrozen ===")
+        train_transform = get_synthetic_transforms()
+        freeze_backbone = False
+        # Override LR default only if user didn't explicitly set it
+        if args.lr == 1e-3:
+            args.lr = 3e-3
+    elif args.mode == "finetune":
+        print("=== FINETUNE MODE: real data, frozen backbone, pretrained weights ===")
+        train_transform = get_train_transforms()
+        freeze_backbone = True
+        if args.lr == 1e-3:
+            args.lr = 5e-4
+    else:
+        train_transform = get_train_transforms()
+        freeze_backbone = True
+
     # Datasets
-    full = VimuDataset(args.data_dir, args.num_joints, get_train_transforms())
+    full = VimuDataset(args.data_dir, args.num_joints, train_transform)
     val_n = int(len(full) * args.val_split)
     train_n = len(full) - val_n
     train_set, val_set = random_split(full, [train_n, val_n])
@@ -114,7 +140,15 @@ def main():
     print(f"Train: {train_n} | Val: {val_n}")
 
     # Model
-    model = VimuModel(args.num_joints).to(device)
+    model = VimuModel(args.num_joints, freeze_backbone=freeze_backbone).to(device)
+
+    if args.mode == "finetune":
+        checkpoint = torch.load(args.pretrained_checkpoint, map_location=device)
+        if "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint)
+        print(f"Loaded pretrained weights from {args.pretrained_checkpoint}")
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {trainable:,}")
 
@@ -158,6 +192,7 @@ def main():
                 "num_joints": args.num_joints,
                 "output_dim": model.output_dim,
                 "val_joint_mae": val_j_mae,
+                "mode": args.mode,
             }, os.path.join(args.output_dir, "best.pt"))
             print(f"  → Saved best ({val_j_mae * 57.3:.1f}°)")
 

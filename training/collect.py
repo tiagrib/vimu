@@ -1,16 +1,22 @@
 """
 VIMU Phase 2: Data Collection
 
-Commands the robot through random poses via the Arduino binary protocol,
+Commands the robot through random poses via a pluggable RobotController,
 captures synchronized camera frames, and saves labeled training data.
 
+Supports two controller backends:
+  --ws ws://localhost:8765    Connect to an external WebSocket controller
+                              (e.g., nuttymoves' adelino-standalone)
+  --serial /dev/ttyUSB0       Direct serial to VIMU's built-in Arduino firmware
+
 Usage:
-    python collect.py \
-        --serial /dev/ttyUSB0 \
-        --camera 0 \
-        --num-joints 6 \
-        --num-poses 1500 \
-        --output-dir ./data
+    # WebSocket mode (recommended when using nuttymoves controller)
+    python collect.py sweep --ws ws://localhost:8765 \
+        --camera 0 --num-joints 5 --num-poses 1500 --output-dir ./data
+
+    # Serial mode (standalone, uses VIMU's own Arduino firmware)
+    python collect.py sweep --serial /dev/ttyUSB0 \
+        --camera 0 --num-joints 6 --num-poses 1500 --output-dir ./data
 
 Output:
     data/
@@ -20,16 +26,98 @@ Output:
 
 import argparse
 import csv
+import json
 import os
 import struct
 import time
+from abc import ABC, abstractmethod
 
 import cv2
 import numpy as np
-import serial as pyserial
 
 
-# ─── Arduino binary protocol ─────────────────────────────────────────────────
+# ─── Abstract Robot Controller ──────────────────────────────────────────────
+
+class RobotController(ABC):
+    """Abstract interface for commanding a robot during data collection."""
+
+    @abstractmethod
+    def set_angles(self, angles_rad: list) -> bool:
+        """Set joint positions in radians. Returns True on success."""
+        ...
+
+    @abstractmethod
+    def close(self):
+        """Release resources and return servos to safe state."""
+        ...
+
+
+# ─── WebSocket Controller ───────────────────────────────────────────────────
+
+class WebSocketController(RobotController):
+    """
+    Connects to an external WebSocket-based robot controller.
+
+    Compatible with nuttymoves' arduino-controller WebSocket protocol:
+      Send: {"type": "command", "positions": [rad1, rad2, ...]}
+      Recv: {"type": "state", "positions": [...], ...}
+    """
+
+    def __init__(self, url: str, num_joints: int):
+        try:
+            import websocket as ws_lib
+        except ImportError:
+            raise ImportError(
+                "websocket-client package required for WebSocket mode. "
+                "Install with: pip install websocket-client"
+            )
+
+        self.url = url
+        self.num_joints = num_joints
+        self.ws = ws_lib.WebSocket()
+        self.ws.settimeout(5.0)
+        print(f"Connecting to controller at {url}...")
+        self.ws.connect(url)
+        print(f"Connected to WebSocket controller at {url}")
+
+    def set_angles(self, angles_rad: list) -> bool:
+        """Send joint positions via WebSocket. Returns True on success."""
+        msg = json.dumps({
+            "type": "command",
+            "positions": [float(a) for a in angles_rad],
+        })
+        try:
+            self.ws.send(msg)
+            # Read back state to confirm (non-blocking best-effort)
+            try:
+                self.ws.settimeout(0.5)
+                response = self.ws.recv()
+                self.ws.settimeout(5.0)
+                # State received = controller is alive
+                return True
+            except Exception:
+                # Timeout is fine — controller may not send state immediately
+                return True
+        except Exception as e:
+            print(f"  WebSocket send failed: {e}")
+            return False
+
+    def close(self):
+        """Send neutral pose and disconnect."""
+        try:
+            neutral = [0.0] * self.num_joints
+            self.set_angles(neutral)
+            time.sleep(0.1)
+        except Exception:
+            pass
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+        print("WebSocket controller disconnected")
+
+
+# ─── Serial Controller (legacy/standalone) ──────────────────────────────────
 
 FRAME_START_TX = 0xAA
 FRAME_START_RX = 0xBB
@@ -40,10 +128,17 @@ SERVO_MIN_US = 500
 SERVO_MAX_US = 2500
 
 
-class ServoController:
-    """Communicates with the Arduino data-collection firmware."""
+class SerialController(RobotController):
+    """
+    Direct serial communication with VIMU's data-collection Arduino firmware.
+
+    Uses the VIMU binary protocol at 500kbaud. Use this for standalone VIMU
+    setups that don't use an external controller like nuttymoves.
+    """
 
     def __init__(self, port: str, baud: int = 500000, num_servos: int = 6):
+        import serial as pyserial
+
         self.ser = pyserial.Serial(port, baud, timeout=0.1)
         self.num_servos = num_servos
         time.sleep(2.5)  # Wait for Arduino reset
@@ -75,7 +170,7 @@ class ServoController:
         return False
 
     def set_angles(self, angles_rad: list) -> bool:
-        """Set servo positions. Angles in radians [-π/2, +π/2]."""
+        """Set servo positions. Angles in radians [-pi/2, +pi/2]."""
         payload = b""
         for angle in angles_rad:
             norm = (angle + np.pi / 2) / np.pi
@@ -85,13 +180,27 @@ class ServoController:
         self._send(CMD_SET_POSITIONS, payload)
         return self._read_response()
 
-    def detach(self):
+    def _detach(self):
         self._send(CMD_DETACH_ALL)
         self._read_response()
 
     def close(self):
-        self.detach()
+        self._detach()
         self.ser.close()
+        print("Serial controller disconnected")
+
+
+# ─── Controller factory ─────────────────────────────────────────────────────
+
+def create_controller(args) -> RobotController:
+    """Create the appropriate controller based on CLI arguments."""
+    if hasattr(args, "ws") and args.ws:
+        num_joints = args.num_joints
+        return WebSocketController(args.ws, num_joints)
+    elif hasattr(args, "serial") and args.serial:
+        return SerialController(args.serial, args.baud, args.num_joints)
+    else:
+        raise ValueError("Must specify either --ws or --serial")
 
 
 # ─── Pose generation ─────────────────────────────────────────────────────────
@@ -135,8 +244,8 @@ def collect(args):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    # Open Arduino
-    servo = ServoController(args.serial, args.baud, args.num_joints)
+    # Open controller
+    controller = create_controller(args)
 
     # Generate poses
     poses = generate_poses(args.num_joints, args.num_poses, seed=args.seed)
@@ -157,11 +266,11 @@ def collect(args):
 
             for idx, pose in enumerate(poses):
                 # Command the servos
-                ok = servo.set_angles(pose)
+                ok = controller.set_angles(pose)
                 if not ok:
-                    print(f"  WARNING: Servo command failed at pose {idx}, retrying...")
+                    print(f"  WARNING: Command failed at pose {idx}, retrying...")
                     time.sleep(0.1)
-                    ok = servo.set_angles(pose)
+                    ok = controller.set_angles(pose)
                     if not ok:
                         print(f"  Skipping pose {idx}")
                         continue
@@ -198,11 +307,11 @@ def collect(args):
                     break
 
     finally:
-        servo.close()
+        controller.close()
         cap.release()
         cv2.destroyAllWindows()
 
-    print(f"\nDone! Collected {collected} labeled frames → {args.output_dir}")
+    print(f"\nDone! Collected {collected} labeled frames -> {args.output_dir}")
     print(f"Next step: python train.py --data-dir {args.output_dir} --num-joints {args.num_joints}")
 
 
@@ -281,8 +390,10 @@ def main():
 
     # Automated sweep mode
     auto = sub.add_parser("sweep", help="Automated random pose sweep")
-    auto.add_argument("--serial", required=True, help="Arduino serial port")
-    auto.add_argument("--baud", type=int, default=500000)
+    ctrl_group = auto.add_mutually_exclusive_group(required=True)
+    ctrl_group.add_argument("--ws", help="WebSocket URL of robot controller (e.g., ws://localhost:8765)")
+    ctrl_group.add_argument("--serial", help="Arduino serial port (direct serial mode)")
+    auto.add_argument("--baud", type=int, default=500000, help="Serial baud rate (serial mode only)")
     auto.add_argument("--camera", type=int, default=0)
     auto.add_argument("--num-joints", type=int, default=6)
     auto.add_argument("--num-poses", type=int, default=1500)

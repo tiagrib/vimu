@@ -12,6 +12,8 @@ use crate::ekf::PoseEkf;
 #[cfg(feature = "camera")]
 use crate::model::Model;
 #[cfg(feature = "camera")]
+use crate::display::DisplayRenderer;
+#[cfg(feature = "camera")]
 use crate::ws::WsServer;
 
 pub struct Config {
@@ -71,6 +73,9 @@ pub fn run(config: Config) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let ws = WsServer::start(config.ws_port, &rt)?;
 
+    // Display renderer
+    let display_renderer = DisplayRenderer::new(&dim_names, None);
+
     // Main loop
     let frame_duration = std::time::Duration::from_secs_f64(1.0 / config.target_fps as f64);
     let start = Instant::now();
@@ -98,6 +103,7 @@ pub fn run(config: Config) -> Result<()> {
         let measurement: Vec<f64> = raw.iter().map(|&x| x as f64).collect();
         let state = ekf.update(&measurement, timestamp);
 
+        let latency_ms = loop_start.elapsed().as_secs_f64() * 1000.0;
         frame_count += 1;
 
         // FPS (update every 0.5s)
@@ -130,7 +136,7 @@ pub fn run(config: Config) -> Result<()> {
 
         // 6. Optional display
         if config.display {
-            if show_preview(display_frame, &dim_names, &state, fps)? {
+            if display_renderer.render(display_frame, &state, &dim_names, fps, latency_ms, ws.client_count())? {
                 break; // 'q' pressed
             }
         }
@@ -153,41 +159,6 @@ pub fn run(config: Config) -> Result<()> {
 
     log::info!("Stopped after {} frames", frame_count);
     Ok(())
-}
-
-#[cfg(feature = "camera")]
-fn show_preview(
-    frame: &opencv::core::Mat,
-    names: &[String],
-    state: &crate::ekf::EkfState,
-    fps: f64,
-) -> Result<bool> {
-    let mut display = frame.clone();
-    let font = opencv::imgproc::FONT_HERSHEY_SIMPLEX;
-    let green = opencv::core::Scalar::new(0.0, 255.0, 0.0, 0.0);
-
-    opencv::imgproc::put_text(
-        &mut display,
-        &format!("{fps:.0} FPS"),
-        opencv::core::Point::new(10, 20),
-        font, 0.5, green, 1, opencv::imgproc::LINE_8, false,
-    )?;
-
-    for (i, name) in names.iter().enumerate().take(10) {
-        let text = format!(
-            "{}: {:+.2} v={:+.2} a={:+.2}",
-            name, state.positions[i], state.velocities[i], state.accelerations[i],
-        );
-        opencv::imgproc::put_text(
-            &mut display,
-            &text,
-            opencv::core::Point::new(10, 40 + i as i32 * 18),
-            font, 0.38, green, 1, opencv::imgproc::LINE_8, false,
-        )?;
-    }
-
-    opencv::highgui::imshow("VIMU", &display)?;
-    Ok(opencv::highgui::wait_key(1)? == 'q' as i32)
 }
 
 #[cfg(test)]

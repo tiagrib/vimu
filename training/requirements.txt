@@ -5,5 +5,7 @@ pandas>=2.0
 numpy>=1.24
 onnx>=1.14
 onnxruntime>=1.16
+onnxscript>=0.1
 pyserial>=3.5
+websocket-client>=1.6.0
 pytest>=7.0

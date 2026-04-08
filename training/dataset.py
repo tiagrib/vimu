@@ -33,6 +33,19 @@ def get_train_transforms(size: int = 224):
     ])
 
 
+def get_synthetic_transforms(size: int = 224):
+    """Transforms for synthetic data — aggressive augmentation to bridge sim-to-real gap."""
+    return transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+        transforms.RandomAffine(degrees=5, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+        transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),
+    ])
+
+
 def get_val_transforms(size: int = 224):
     return transforms.Compose([
         transforms.Resize((size, size)),

@@ -5,5 +5,12 @@
     "OPENCV_INCLUDE_PATHS": "C:\\opencv\\opencv\\build\\include",
     "OPENCV_LINK_LIBS": "opencv_world4100",
     "PATH": "${env:PATH};C:\\Users\\tiagr\\.cargo\\bin;C:\\Users\\tiagr\\OneDrive\\Documentos\\LLVM\\bin;C:\\opencv\\opencv\\build\\x64\\vc16\\bin"
-  }
+  },
+  "python-envs.pythonProjects": [
+    {
+      "path": ".",
+      "envManager": "ms-python.python:venv",
+      "packageManager": "ms-python.python:pip"
+    }
+  ]
 }
