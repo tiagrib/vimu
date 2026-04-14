@@ -10,7 +10,7 @@ use crate::camera::Camera;
 #[cfg(feature = "camera")]
 use crate::ekf::PoseEkf;
 #[cfg(feature = "camera")]
-use crate::model::Model;
+use crate::model::{Model, SegmentorModel};
 #[cfg(feature = "camera")]
 use crate::display::DisplayRenderer;
 #[cfg(feature = "camera")]
@@ -18,6 +18,7 @@ use crate::ws::WsServer;
 
 pub struct Config {
     pub model_path: String,
+    pub seg_model_path: String,
     pub meta_path: String,
     pub camera_id: i32,
     pub ws_port: u16,
@@ -53,7 +54,8 @@ pub(crate) struct DimState {
 
 #[cfg(feature = "camera")]
 pub fn run(config: Config) -> Result<()> {
-    // Load model
+    // Load models
+    let mut segmentor = SegmentorModel::load(&config.seg_model_path)?;
     let mut model = Model::load(&config.model_path, &config.meta_path)?;
     let dim_names = model.meta.outputs.clone();
     let num_dims = model.meta.output_dim;
@@ -93,12 +95,16 @@ pub fn run(config: Config) -> Result<()> {
         let loop_start = Instant::now();
 
         // 1. Capture
-        let (rgb_bytes, display_frame) = camera.grab()?;
+        let (mut rgb_bytes, display_frame) = camera.grab()?;
 
-        // 2. Infer
+        // 2. Segment — mask out background
+        let mask = segmentor.segment(&rgb_bytes, 640, 480)?;
+        SegmentorModel::apply_mask(&mut rgb_bytes, &mask, 640, 480);
+
+        // 3. Infer pose from masked image
         let raw = model.predict(&rgb_bytes)?;
 
-        // 3. EKF
+        // 4. EKF
         let timestamp = start.elapsed().as_secs_f64();
         let measurement: Vec<f64> = raw.iter().map(|&x| x as f64).collect();
         let state = ekf.update(&measurement, timestamp);
@@ -112,7 +118,7 @@ pub fn run(config: Config) -> Result<()> {
             fps_timer = Instant::now();
         }
 
-        // 4. Build message
+        // 5. Build message
         let msg = StateMessage {
             timestamp,
             fps,
@@ -129,12 +135,12 @@ pub fn run(config: Config) -> Result<()> {
                 .collect(),
         };
 
-        // 5. Broadcast
+        // 6. Broadcast
         if let Ok(json) = serde_json::to_string(&msg) {
             ws.broadcast(&json);
         }
 
-        // 6. Optional display
+        // 7. Optional display
         if config.display {
             if display_renderer.render(display_frame, &state, &dim_names, fps, latency_ms, ws.client_count())? {
                 break; // 'q' pressed

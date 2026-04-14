@@ -1,45 +1,66 @@
-"""Tests for collect.py controller abstractions and utilities."""
+"""Tests for collect_pose.py controller and utilities."""
 
 import json
 import threading
 import time
-import types
 
 import pytest
 
-from collect import (
-    DEFAULT_JOINT_RANGES,
-    RobotController,
-    SerialController,
+from collect_pose import (
     WebSocketController,
-    create_controller,
     generate_poses,
+    load_calibration,
 )
 
 
-# ─── 1. Abstract base class ────────────────────────────────────────────────
+# ─── Calibration loader ──────────────────────────────────────────────────────
 
 
-def test_robot_controller_is_abstract():
-    """RobotController cannot be instantiated directly."""
-    with pytest.raises(TypeError):
-        RobotController()
+def test_load_calibration(tmp_path):
+    """load_calibration parses a TOML file and returns joint ranges."""
+    toml = tmp_path / "cal.toml"
+    toml.write_text(
+        'robot_name = "test"\n'
+        'created_at = "unix:0"\n'
+        'notes = ""\n'
+        "\n"
+        "[[joints]]\n"
+        'name = "J1"\n'
+        "center_pwm = 1500\n"
+        "pwm_per_rad_pos = 500.0\n"
+        "pwm_per_rad_neg = 500.0\n"
+        "min_rad = -1.0\n"
+        "max_rad = 1.0\n"
+        "inverted = false\n"
+        "\n"
+        "[[joints]]\n"
+        'name = "J2"\n'
+        "center_pwm = 1500\n"
+        "pwm_per_rad_pos = 500.0\n"
+        "pwm_per_rad_neg = 500.0\n"
+        "min_rad = -0.5\n"
+        "max_rad = 0.8\n"
+        "inverted = true\n"
+    )
+    joints = load_calibration(str(toml))
+    assert len(joints) == 2
+    assert joints[0]["name"] == "J1"
+    assert joints[0]["min_rad"] == -1.0
+    assert joints[0]["max_rad"] == 1.0
+    assert joints[1]["name"] == "J2"
+    assert joints[1]["min_rad"] == -0.5
+    assert joints[1]["max_rad"] == 0.8
 
 
-# ─── 2 & 3. Subclass checks ────────────────────────────────────────────────
+def test_load_calibration_empty_raises(tmp_path):
+    """load_calibration raises on a file with no joints."""
+    toml = tmp_path / "empty.toml"
+    toml.write_text('robot_name = "test"\ncreated_at = "unix:0"\nnotes = ""\n')
+    with pytest.raises(ValueError, match="No joints"):
+        load_calibration(str(toml))
 
 
-def test_serial_controller_implements_interface():
-    """SerialController is a subclass of RobotController."""
-    assert issubclass(SerialController, RobotController)
-
-
-def test_websocket_controller_implements_interface():
-    """WebSocketController is a subclass of RobotController."""
-    assert issubclass(WebSocketController, RobotController)
-
-
-# ─── 4. WebSocket connect & send ────────────────────────────────────────────
+# ─── WebSocket Controller ────────────────────────────────────────────────────
 
 
 def _start_mock_ws_server():
@@ -81,9 +102,6 @@ def test_websocket_controller_connects_and_sends():
         server.shutdown()
 
 
-# ─── 5. close() sends neutral ──────────────────────────────────────────────
-
-
 def test_websocket_controller_close_sends_neutral():
     """close() sends a command with all-zero positions."""
     server, port, received = _start_mock_ws_server()
@@ -92,55 +110,36 @@ def test_websocket_controller_close_sends_neutral():
         ctrl.close()
         time.sleep(0.2)
 
-        # The last command should be the neutral pose
         neutrals = [m for m in received if m["positions"] == [0.0, 0.0, 0.0]]
         assert len(neutrals) >= 1
     finally:
         server.shutdown()
 
 
-# ─── 6. create_controller with --ws ────────────────────────────────────────
-
-
-def test_create_controller_with_ws():
-    """create_controller returns WebSocketController when ws arg is set."""
-    server, port, _ = _start_mock_ws_server()
-    try:
-        args = types.SimpleNamespace(ws=f"ws://localhost:{port}", num_joints=3)
-        ctrl = create_controller(args)
-        assert isinstance(ctrl, WebSocketController)
-        ctrl.ws.close()
-    finally:
-        server.shutdown()
-
-
-# ─── 7. create_controller serial without port ──────────────────────────────
-
-
-def test_create_controller_with_serial_raises_without_port():
-    """create_controller raises when the serial port does not exist."""
-    args = types.SimpleNamespace(
-        ws=None,
-        serial="/dev/ttyNONEXISTENT999",
-        baud=500000,
-        num_joints=6,
-    )
-    with pytest.raises(Exception):
-        create_controller(args)
-
-
-# ─── 8. generate_poses ─────────────────────────────────────────────────────
+# ─── Pose generation ─────────────────────────────────────────────────────────
 
 
 def test_generate_poses():
     """generate_poses returns correct count with values in range."""
-    num_joints = 3
-    num_poses = 10
-    poses = generate_poses(num_joints, num_poses)
+    joint_ranges = [
+        {"name": "J1", "min_rad": -1.0, "max_rad": 1.0},
+        {"name": "J2", "min_rad": -0.5, "max_rad": 0.8},
+        {"name": "J3", "min_rad": -1.2, "max_rad": 1.2},
+    ]
+    poses = generate_poses(joint_ranges, num_poses=10)
 
-    assert len(poses) == num_poses
+    assert len(poses) == 10
     for pose in poses:
-        assert len(pose) == num_joints
+        assert len(pose) == 3
         for i, val in enumerate(pose):
-            lo, hi = DEFAULT_JOINT_RANGES[i]
-            assert lo <= val <= hi, f"Joint {i} value {val} out of range [{lo}, {hi}]"
+            lo = joint_ranges[i]["min_rad"]
+            hi = joint_ranges[i]["max_rad"]
+            assert lo <= val <= hi
+
+
+def test_generate_poses_deterministic():
+    """Same seed produces identical poses."""
+    jr = [{"name": "J1", "min_rad": -1.0, "max_rad": 1.0}]
+    a = generate_poses(jr, 5, seed=99)
+    b = generate_poses(jr, 5, seed=99)
+    assert a == b

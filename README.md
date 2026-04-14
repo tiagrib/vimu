@@ -1,93 +1,71 @@
-# VIMU — Vision-Based Proprioception
+# VIMU v2 — Vision-Based Proprioception
 
 Estimates joint angles, base orientation, velocity, and acceleration
 of a hobby servo robot from an external camera. Broadcasts state over
 WebSocket for consumption by a separate behavior/motion system.
 
+v2 introduces a segmentation-first pipeline: segment the robot, then
+estimate pose from the masked image. This decouples the model from the
+background and camera position.
+
 ## Architecture
 
 ```
-Phase 1-2: Data Collection (Python + Arduino)
-┌──────────┐    serial     ┌─────────┐     camera    ┌──────────┐
-│  Python  │──────────────→│ Arduino │               │  Webcam  │
-│ collect  │  binary proto │ servos  │               │          │
-│          │←──────────────│         │               │          │
-└────┬─────┘               └─────────┘               └────┬─────┘
-     │                                                     │
-     └──────────────── labels.csv + frames/ ───────────────┘
+Phase 1-2: Segmentation (SAM2 annotation + YOLO training)
+    Video clips  →  SAM2-tiny (one click)  →  masks  →  YOLO11n-seg training
 
-Phase 3: Training (Python)
-    frames/ + labels.csv → ResNet-18 → checkpoints/best.pt → vimu.onnx
+Phase 3: Pose Data Collection (nuttymoves controller + live segmentation)
+┌──────────┐     ws      ┌──────────────┐   serial   ┌─────────┐
+│  Python  │────────────→│  adelino-    │───────────→│ Arduino │
+│ collect  │  JSON cmds  │  standalone  │  bin proto  │ servos  │
+│ _pose    │←────────────│  (Rust)      │←───────────│         │
+└────┬─────┘             └──────────────┘             └─────────┘
+     │ + YOLO seg live     calibration.toml
+     │                                                ┌──────────┐
+     └──── pose_data/masked/*.jpg + labels.csv ───────│  Webcam  │
+                                                      └──────────┘
 
-Phase 4: Inference (Rust)
-┌─────────────────────────────────────────────────────┐
-│  vimu binary                                        │
-│                                                     │
-│  Camera ──→ ONNX Runtime (GPU) ──→ EKF ──→ WebSocket│
-│  ~2ms         ~3-5ms              <0.1ms    broadcast│
-│                                                     │
-│  Total: ~7ms per frame → 100+ FPS                   │
-└─────────────────────┬───────────────────────────────┘
+Phase 4: Training (Python)
+    masked frames + labels.csv → DINOv2-small + LoRA → checkpoints/best.pt
+
+Phase 5: Export
+    best.pt → merge LoRA → vimu_pose.onnx
+    vimu_seg.pt → vimu_seg.onnx
+
+Phase 6: Inference (Rust)
+┌─────────────────────────────────────────────────────────┐
+│  vimu binary                                            │
+│                                                         │
+│  Camera → YOLO seg → Mask → DINOv2 → EKF → WebSocket   │
+│  ~2ms     ~3ms       <1ms   ~4ms    <0.1ms  broadcast   │
+│                                                         │
+│  Total: ~11ms per frame → ~90 FPS                       │
+└─────────────────────┬───────────────────────────────────┘
                       │ ws://localhost:9001
                       ▼
               [ Your behavior system ]
 ```
 
-## WebSocket Message Format
-
-Each frame produces a JSON message:
-
-```json
-{
-  "timestamp": 1.234,
-  "fps": 92.3,
-  "dims": [
-    {
-      "name": "joint_1",
-      "raw": 0.523,
-      "position": 0.518,
-      "velocity": 0.032,
-      "acceleration": -0.104
-    },
-    {
-      "name": "joint_2",
-      "raw": -0.291,
-      "position": -0.287,
-      "velocity": -0.015,
-      "acceleration": 0.042
-    },
-    ...
-    {
-      "name": "base_roll",
-      "raw": 0.012,
-      "position": 0.010,
-      "velocity": 0.001,
-      "acceleration": -0.003
-    },
-    {
-      "name": "base_pitch",
-      "raw": -0.034,
-      "position": -0.031,
-      "velocity": -0.008,
-      "acceleration": 0.005
-    }
-  ]
-}
-```
-
-- `raw`: direct model output (noisy)
-- `position`: EKF-filtered value (smooth)
-- `velocity`: first derivative estimate (rad/s)
-- `acceleration`: second derivative estimate (rad/s²)
-- All angles in radians
-
 ## Setup & Workflow
+
+### Before you start
+
+Complete the Adelino controller setup first (see `projects/adelino/guides/02-adelino-control.md`):
+1. Wire hardware and flash firmware
+2. Calibrate servos -- this produces `calibration.toml`
+3. Verify the controller runs: `adelino-standalone run --port COM3 --calibration calibration.toml`
+
+The calibration TOML is used throughout the VIMU pipeline to know how many joints the robot has and their safe angular ranges.
 
 ### Prerequisites
 
 ```bash
-# Python (training)
+# Python (all phases)
 pip install torch torchvision opencv-python pandas numpy onnx onnxruntime-gpu
+pip install websocket-client   # for collect_pose.py
+pip install transformers peft  # DINOv2 + LoRA
+pip install ultralytics        # YOLO11n-seg
+pip install git+https://github.com/facebookresearch/sam2.git  # Phase 1 only
 
 # Rust (inference)
 # - Rust toolchain: https://rustup.rs
@@ -96,96 +74,101 @@ pip install torch torchvision opencv-python pandas numpy onnx onnxruntime-gpu
 # - ONNX Runtime is fetched automatically by the ort crate
 ```
 
-### Phase 1: Arduino Setup
+### Phase 1: Collect Segmentation Data
 
-1. Open `arduino/data_collection_controller/data_collection_controller.ino`
-2. Set `NUM_SERVOS`, `SERVO_PINS[]`, `SERVO_MIN_US`, `SERVO_MAX_US`
-3. Upload to your Arduino
-4. Note the serial port (e.g., `/dev/ttyUSB0`)
+Film the robot from various angles and environments. No servo control needed --
+the robot just sits there in static poses. Use your phone or a handheld camera.
 
-### Phase 2: Collect Training Data
+1. Place the robot on a table, record a 30-60s video orbiting around it
+2. Move to a different room or lighting, record another orbit
+3. Put the robot in 3-5 different poses (manually bend joints), orbit each
+4. Save videos to a folder (e.g. `vimu/training/videos/`)
 
-```bash
-cd training/
-
-# Automated sweep: robot cycles through random poses
-python collect.py sweep \
-    --serial /dev/ttyUSB0 \
-    --camera 0 \
-    --num-joints 6 \
-    --num-poses 1500 \
-    --settle 0.6 \
-    --output-dir ./data
-
-# Optional: add tilted base samples for orientation training
-python collect.py tilted \
-    --camera 0 \
-    --num-joints 6 \
-    --output-dir ./data
-```
-
-Customize `DEFAULT_JOINT_RANGES` in `collect.py` to match your
-robot's mechanical limits per joint.
-
-### Phase 3: Train
+Then annotate with SAM2 (one click per clip):
 
 ```bash
-python train.py \
-    --data-dir ./data \
-    --num-joints 6 \
-    --epochs 100 \
-    --batch-size 32
+cd vimu/training/
 
-# Target: joint MAE under 5° (0.087 rad)
+python annotate_seg.py --video-dir ./videos/ --output seg_data/
 ```
 
-### Phase 4a: Export to ONNX
+This extracts frames and shows the first frame of each video. Click once on the
+robot, press Enter, and SAM2 propagates the mask through the entire clip.
+
+### Phase 2: Train Segmentor
 
 ```bash
-python export_onnx.py \
-    --checkpoint ./checkpoints/best.pt \
-    --output ./vimu.onnx
-
-# Produces: vimu.onnx + vimu.json (metadata)
+python train_segmentor.py --data seg_data/ --output vimu_seg.pt --epochs 50
 ```
 
-### Phase 4b: Build & Run Inference
+Target: >95% mIoU on held-out frames.
+
+### Phase 3: Collect Pose Data
+
+Start the nuttymoves controller, then collect from multiple camera angles:
+
+```bash
+# Terminal 1: start controller
+cd projects/adelino
+cargo run --release -p adelino-standalone -- run --port COM3 --calibration calibration.toml
+
+# Terminal 2: collect pose data
+cd vimu/training/
+
+# First angle
+python collect_pose.py sweep \
+    --calibration ../../projects/adelino/target/release/calibration.toml \
+    --seg-model vimu_seg.pt \
+    --camera 0 --num-poses 500
+
+# Move tripod, then append from a new angle
+python collect_pose.py sweep \
+    --calibration ../../projects/adelino/target/release/calibration.toml \
+    --seg-model vimu_seg.pt \
+    --camera 0 --num-poses 500 --append
+```
+
+### Phase 4: Train Pose Model
+
+```bash
+python train.py --data ./pose_data --epochs 100
+
+# Target: joint MAE under 3° (0.05 rad)
+```
+
+The number of joints is auto-detected from `labels.csv`.
+
+### Phase 5: Export to ONNX
+
+```bash
+python export_onnx.py --checkpoint checkpoints/best.pt --output vimu_pose.onnx
+python export_seg.py --model vimu_seg.pt --output vimu_seg.onnx
+```
+
+### Phase 6: Run Inference
 
 ```bash
 cd inference/
 cargo build --release
 
 ./target/release/vimu \
-    --model ../training/vimu.onnx \
-    --camera 0 \
-    --port 9001 \
-    --fps 60 \
-    --display   # optional preview window
+    --model ../training/vimu_pose.onnx \
+    --seg-model ../training/vimu_seg.onnx \
+    --camera 0 --port 9001 --display
 ```
 
-### Connect Your Client
+## WebSocket Message Format
 
-```javascript
-const ws = new WebSocket("ws://localhost:9001");
-ws.onmessage = (event) => {
-    const state = JSON.parse(event.data);
-    // state.dims[0].position  → joint_1 angle (filtered)
-    // state.dims[0].velocity  → joint_1 angular velocity
-    // state.dims[6].position  → base_roll
-    // etc.
-};
-```
+Same as v1 — no changes for downstream consumers:
 
-```python
-import asyncio, websockets, json
-
-async def listen():
-    async with websockets.connect("ws://localhost:9001") as ws:
-        async for msg in ws:
-            state = json.loads(msg)
-            joint_angles = [d["position"] for d in state["dims"][:6]]
-            base_roll = state["dims"][6]["position"]
-            # feed to your behavior system
+```json
+{
+  "timestamp": 1.234,
+  "fps": 92.3,
+  "dims": [
+    {"name": "joint_1", "raw": 0.523, "position": 0.518, "velocity": 0.032, "acceleration": -0.104}
+  ]
+}
 ```
 
 ## EKF Tuning
@@ -196,29 +179,30 @@ async def listen():
 | Normal motion | 10.0 | 0.01 |
 | Hopping (responsiveness) | 50.0 | 0.005 |
 
-Higher process noise → faster response to sudden changes, noisier derivatives.
-Lower measurement noise → trusts model more, but won't correct model errors.
-
 ## Project Structure
 
 ```
 vimu/
-├── arduino/
-│   └── data_collection_controller/
-│       └── data_collection_controller.ino
+├── arduino/                        # Legacy standalone firmware (not needed with nuttymoves)
 ├── training/
-│   ├── collect.py          # Phase 2: data collection
-│   ├── model.py            # ResNet-18 + regression head
-│   ├── dataset.py          # Data loader
-│   ├── train.py            # Phase 3: training loop
-│   └── export_onnx.py      # Phase 4a: ONNX export
+│   ├── annotate_seg.py             # Phase 1: SAM2 mask annotation
+│   ├── train_segmentor.py          # Phase 2: YOLO11n-seg training
+│   ├── collect_pose.py             # Phase 3: pose collection with live segmentation
+│   ├── model.py                    # DINOv2-small + LoRA + regression head
+│   ├── dataset.py                  # Data loader (reads from pose_data/masked/)
+│   ├── train.py                    # Phase 4: training loop
+│   ├── export_onnx.py              # Phase 5: pose model ONNX export
+│   └── export_seg.py               # Phase 5: segmentor ONNX export
 └── inference/
     ├── Cargo.toml
     └── src/
-        ├── main.rs          # CLI
-        ├── model.rs         # ONNX GPU inference
-        ├── ekf.rs           # Kalman filter
-        ├── camera.rs        # OpenCV capture
-        ├── ws.rs            # WebSocket broadcast
-        └── pipeline.rs      # Main loop
+        ├── main.rs                 # CLI (--model + --seg-model)
+        ├── model.rs                # Pose model + SegmentorModel (ONNX)
+        ├── ekf.rs                  # Kalman filter (unchanged)
+        ├── camera.rs               # OpenCV capture (unchanged)
+        ├── ws.rs                   # WebSocket broadcast (unchanged)
+        ├── display.rs              # Preview overlay
+        └── pipeline.rs             # Main loop (capture → segment → mask → predict → EKF → broadcast)
 ```
+
+See `metak-shared/VIMU_v2_Architecture.md` for the full architectural design document.

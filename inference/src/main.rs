@@ -12,9 +12,13 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "vimu", about = "Vision-based proprioception — inference server")]
 struct Cli {
-    /// Path to ONNX model file
+    /// Path to pose ONNX model file
     #[arg(short, long)]
     model: String,
+
+    /// Path to segmentor ONNX model file (YOLO11n-seg)
+    #[arg(long)]
+    seg_model: String,
 
     /// Path to model metadata JSON (default: model path with .json extension)
     #[arg(long)]
@@ -53,6 +57,7 @@ fn main() -> Result<()> {
 
     let config = pipeline::Config {
         model_path: cli.model,
+        seg_model_path: cli.seg_model,
         meta_path,
         camera_id: cli.camera,
         ws_port: cli.port,

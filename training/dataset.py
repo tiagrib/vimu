@@ -1,10 +1,10 @@
 """
-Dataset for VIMU training.
+Dataset for VIMU v2 training.
 
 Expects:
-    data/
-        frames/*.jpg
-        labels.csv  →  frame, joint_1, ..., joint_N, base_roll, base_pitch
+    pose_data/
+        masked/*.jpg    -- segmented robot images (black background)
+        labels.csv      -- frame, joint_1, ..., joint_N, base_roll, base_pitch
 
 Base orientation columns may contain empty values for frames collected
 on a flat surface (they'll be 0.0 from the sweep collector). Frames
@@ -58,7 +58,7 @@ class VimuDataset(Dataset):
     BASE_COLS = ["base_roll", "base_pitch"]
 
     def __init__(self, data_dir: str, num_joints: int = 6, transform=None):
-        self.frames_dir = os.path.join(data_dir, "frames")
+        self.frames_dir = os.path.join(data_dir, "masked")
         self.num_joints = num_joints
         self.transform = transform or get_val_transforms()
 

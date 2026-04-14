@@ -1,8 +1,11 @@
 """
-VIMU Phase 3: Training
+VIMU v2 Phase 4: Training
+
+Trains DINOv2-small + LoRA on segmented (masked) robot images for joint
+angle regression.
 
 Usage:
-    python train.py --data-dir ./data --num-joints 6 --epochs 100
+    python train.py --data ./pose_data --num-joints 5 --epochs 100
 """
 
 import argparse
@@ -15,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
 from model import VimuModel
-from dataset import VimuDataset, get_train_transforms, get_val_transforms, get_synthetic_transforms
+from dataset import VimuDataset, get_train_transforms, get_val_transforms
 
 
 def masked_mse(pred, target, mask=None):
@@ -85,8 +88,9 @@ def validate(model, loader, device, num_joints):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--num-joints", type=int, default=6)
+    parser.add_argument("--data", required=True, help="Path to pose_data/ directory")
+    parser.add_argument("--num-joints", type=int, default=None,
+                        help="Number of joints (auto-detected from labels.csv if omitted)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -94,64 +98,44 @@ def main():
     parser.add_argument("--output-dir", default="./checkpoints")
     parser.add_argument("--joint-weight", type=float, default=1.0)
     parser.add_argument("--base-weight", type=float, default=0.5)
-    parser.add_argument("--mode", choices=["train", "pretrain", "finetune"], default="train",
-                        help="Training mode: train (default), pretrain (synthetic), finetune (real + pretrained)")
-    parser.add_argument("--pretrained-checkpoint", type=str, default=None,
-                        help="Path to pretrained checkpoint for finetune mode")
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=16)
     args = parser.parse_args()
-
-    # Mode validation
-    if args.mode == "finetune" and not args.pretrained_checkpoint:
-        parser.error("--pretrained-checkpoint required for finetune mode")
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Mode-specific configuration
-    if args.mode == "pretrain":
-        print("=== PRETRAIN MODE: synthetic data, full model unfrozen ===")
-        train_transform = get_synthetic_transforms()
-        freeze_backbone = False
-        # Override LR default only if user didn't explicitly set it
-        if args.lr == 1e-3:
-            args.lr = 3e-3
-    elif args.mode == "finetune":
-        print("=== FINETUNE MODE: real data, frozen backbone, pretrained weights ===")
-        train_transform = get_train_transforms()
-        freeze_backbone = True
-        if args.lr == 1e-3:
-            args.lr = 5e-4
-    else:
-        train_transform = get_train_transforms()
-        freeze_backbone = True
+    # Auto-detect num_joints from labels.csv if not specified
+    if args.num_joints is None:
+        import pandas as pd
+        labels = pd.read_csv(os.path.join(args.data, "labels.csv"), nrows=0)
+        joint_cols = [c for c in labels.columns if c.startswith("joint_")]
+        args.num_joints = len(joint_cols)
+        print(f"Auto-detected {args.num_joints} joints from labels.csv")
 
     # Datasets
-    full = VimuDataset(args.data_dir, args.num_joints, train_transform)
+    full = VimuDataset(args.data, args.num_joints, get_train_transforms())
     val_n = int(len(full) * args.val_split)
     train_n = len(full) - val_n
     train_set, val_set = random_split(full, [train_n, val_n])
 
-    val_ds = VimuDataset(args.data_dir, args.num_joints, get_val_transforms())
+    val_ds = VimuDataset(args.data, args.num_joints, get_val_transforms())
     val_set = torch.utils.data.Subset(val_ds, val_set.indices)
 
     train_loader = DataLoader(train_set, args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_set, args.batch_size, num_workers=2, pin_memory=True)
     print(f"Train: {train_n} | Val: {val_n}")
 
-    # Model
-    model = VimuModel(args.num_joints, freeze_backbone=freeze_backbone).to(device)
+    # Model — DINOv2-small + LoRA + MLP head
+    model = VimuModel(
+        num_joints=args.num_joints,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+    ).to(device)
+    print(f"Trainable params: {model.trainable_params():,} / {model.total_params():,} total")
 
-    if args.mode == "finetune":
-        checkpoint = torch.load(args.pretrained_checkpoint, map_location=device)
-        if "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            model.load_state_dict(checkpoint)
-        print(f"Loaded pretrained weights from {args.pretrained_checkpoint}")
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable params: {trainable:,}")
-
+    # Only optimize trainable parameters (LoRA adapters + regression head)
     optimizer = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad),
         lr=args.lr, weight_decay=1e-4,
@@ -180,7 +164,7 @@ def main():
 
         print(f"Epoch {epoch:3d}/{args.epochs} ({dt:.1f}s) | "
               f"Loss {loss:.4f} | "
-              f"Joint MAE {val_j_mae:.4f} ({val_j_mae * 57.3:.1f}°) | "
+              f"Joint MAE {val_j_mae:.4f} ({val_j_mae * 57.3:.1f}) | "
               f"Base MAE {val_b_mae:.4f} | "
               f"LR {lr:.2e}")
 
@@ -192,14 +176,15 @@ def main():
                 "num_joints": args.num_joints,
                 "output_dim": model.output_dim,
                 "val_joint_mae": val_j_mae,
-                "mode": args.mode,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
             }, os.path.join(args.output_dir, "best.pt"))
-            print(f"  → Saved best ({val_j_mae * 57.3:.1f}°)")
+            print(f"  -> Saved best ({val_j_mae * 57.3:.1f})")
 
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([epoch, loss, j_loss, b_loss, val_j_mae, val_b_mae, lr])
 
-    print(f"\nDone. Best joint MAE: {best_mae * 57.3:.1f}°")
+    print(f"\nDone. Best joint MAE: {best_mae * 57.3:.1f}")
     print(f"Export: python export_onnx.py --checkpoint {args.output_dir}/best.pt")
 
 

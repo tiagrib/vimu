@@ -1,8 +1,11 @@
 """
-VIMU Phase 4a: Export trained model to ONNX for Rust inference.
+VIMU v2 Phase 5: Export trained pose model to ONNX for Rust inference.
+
+Merges LoRA weights into the base DINOv2 model before export so the
+ONNX file is a single, standard forward pass with no runtime overhead.
 
 Usage:
-    python export_onnx.py --checkpoint ./checkpoints/best.pt --output ./vimu.onnx
+    python export_onnx.py --checkpoint ./checkpoints/best.pt --output ./vimu_pose.onnx
 """
 
 import argparse
@@ -23,10 +26,13 @@ def export(checkpoint_path: str, output_path: str):
 
     model = VimuModel(num_joints=num_joints)
     model.load_state_dict(ckpt["model_state_dict"])
+
+    # Merge LoRA weights into base DINOv2 for a clean single-pass ONNX
+    model.merge_lora()
     model.eval()
 
     print(f"Model: {num_joints} joints, {output_dim} outputs")
-    print(f"  Trained to epoch {ckpt['epoch']}, val MAE {ckpt['val_joint_mae']*57.3:.1f}°")
+    print(f"  Trained to epoch {ckpt['epoch']}, val MAE {ckpt['val_joint_mae']*57.3:.1f}")
 
     dummy = torch.randn(1, 3, 224, 224)
 
@@ -60,13 +66,13 @@ def export(checkpoint_path: str, output_path: str):
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"Exported → {output_path}")
-    print(f"Metadata → {meta_path}")
+    print(f"Exported: {output_path}")
+    print(f"Metadata: {meta_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--output", default="./vimu.onnx")
+    parser.add_argument("--output", default="./vimu_pose.onnx")
     args = parser.parse_args()
     export(args.checkpoint, args.output)

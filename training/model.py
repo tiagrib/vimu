@@ -1,35 +1,48 @@
 """
-VIMU model: ResNet-18 backbone → regression head.
+VIMU v2 model: DINOv2-small backbone + LoRA adapters + regression head.
 
 Output: [joint_1, ..., joint_N, base_roll, base_pitch]
 
-The base_x, base_y outputs from before are dropped since we're
-focused on proprioception (internal state), not external tracking.
+DINOv2's self-supervised features encode part-level spatial structure,
+which is ideal for understanding articulated robot joints. LoRA keeps
+the trainable parameter count low (~300K) to avoid overfitting on small
+datasets.
 """
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
 
 
 class VimuModel(nn.Module):
-    def __init__(self, num_joints: int = 6, freeze_backbone: bool = True):
+    def __init__(self, num_joints: int = 5, lora_rank: int = 8, lora_alpha: int = 16):
         super().__init__()
         self.num_joints = num_joints
         self.output_dim = num_joints + 2  # + base_roll, base_pitch
 
-        backbone = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.features = nn.Sequential(*list(backbone.children())[:-1])  # → (B, 512, 1, 1)
+        # Load DINOv2-small (ViT-S/14, 384-dim CLS token)
+        from transformers import AutoModel
 
-        if freeze_backbone:
-            for name, param in self.features.named_parameters():
-                # Unfreeze only the last two residual blocks (children 6, 7)
-                if "6" not in name and "7" not in name:
-                    param.requires_grad = False
+        self.backbone = AutoModel.from_pretrained("facebook/dinov2-small")
 
+        # Freeze all backbone parameters
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Apply LoRA to attention projection layers
+        from peft import LoraConfig, get_peft_model
+
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=["query", "key", "value", "dense"],
+            lora_dropout=0.1,
+            bias="none",
+        )
+        self.backbone = get_peft_model(self.backbone, lora_config)
+
+        # Regression head on top of [CLS] token
         self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(512, 256),
+            nn.Linear(384, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 128),
@@ -47,16 +60,26 @@ class VimuModel(nn.Module):
         Args:
             x: (B, 3, 224, 224) ImageNet-normalized RGB tensor.
         Returns:
-            (B, num_joints + 2) — joint angles then [base_roll, base_pitch]
+            (B, num_joints + 2) -- joint angles then [base_roll, base_pitch]
         """
-        return self.head(self.features(x))
+        outputs = self.backbone(x)
+        cls_token = outputs.last_hidden_state[:, 0]  # (B, 384)
+        return self.head(cls_token)
+
+    def merge_lora(self):
+        """Merge LoRA weights into the base model for export."""
+        self.backbone = self.backbone.merge_and_unload()
+
+    def trainable_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def total_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
 
 if __name__ == "__main__":
-    model = VimuModel(num_joints=6)
+    model = VimuModel(num_joints=5)
     dummy = torch.randn(2, 3, 224, 224)
     out = model(dummy)
-    print(f"Output shape: {out.shape}")  # (2, 8)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Params: {trainable:,} trainable / {total:,} total")
+    print(f"Output shape: {out.shape}")  # (2, 7)
+    print(f"Params: {model.trainable_params():,} trainable / {model.total_params():,} total")
