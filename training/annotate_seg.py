@@ -380,8 +380,12 @@ def process_videos(videos: list[str], output_dir: Path, every_n: int, device: st
     print("\nProcessing complete!")
 
 
-def show_status(videos: list[str], output_dir: Path):
+def show_status(videos: list[str], output_dir: Path, video_dir: str):
     """Show annotation and processing status for all videos."""
+    print(f"  Video dir:  {Path(video_dir).resolve()}")
+    print(f"  Output dir: {output_dir.resolve()}")
+    print()
+
     annotated = 0
     total_models = {}
 
@@ -485,7 +489,7 @@ def main():
     print(f"Found {len(videos)} video files")
 
     if args.status:
-        show_status(videos, output_dir)
+        show_status(videos, output_dir, args.video or args.video_dir)
     elif args.process_only:
         process_videos(videos, output_dir, args.every_n, args.device, args.model)
     elif args.annotate_only:
