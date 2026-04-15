@@ -5,13 +5,16 @@ Read the root `AGENTS.md` first for global rules, project structure, and coding 
 
 ## Repo Overview
 
-Python pipeline for data collection, model training, and ONNX export. Contains:
+Python pipeline for segmentation annotation, data collection, model training, and ONNX export. Contains:
 
-- `collect.py` — Automated (sweep) and manual (tilted) data collection via Arduino serial + webcam.
-- `model.py` — ResNet-18 backbone + regression head for joint angle estimation.
+- `annotate_seg.py` — SAM2-based interactive mask annotation (Phase 1).
+- `train_segmentor.py` — YOLO11n-seg training from SAM2 masks (Phase 2).
+- `collect_pose.py` — Pose data collection with live segmentation via WebSocket controller (Phase 3).
+- `model.py` — DINOv2-small + LoRA + regression head for joint angle estimation.
 - `dataset.py` — PyTorch Dataset with augmentation and masked base orientation labels.
-- `train.py` — Training loop with cosine LR schedule, masked losses, checkpointing.
-- `export_onnx.py` — Export trained `.pt` checkpoint to ONNX + metadata JSON.
+- `train.py` — Training loop with cosine LR schedule, masked losses, checkpointing (Phase 4).
+- `export_onnx.py` — Export pose model to ONNX + metadata JSON (Phase 5).
+- `export_seg.py` — Export segmentor to ONNX (Phase 5).
 
 ## Agent Rules
 

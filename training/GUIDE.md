@@ -1,271 +1,204 @@
-# VIMU Training Guide
+# VIMU v2 Training Guide
 
-Step-by-step instructions to go from a bare robot + camera to a working `vimu.onnx` model.
+Step-by-step instructions to go from a bare robot + camera to working ONNX models for real-time inference.
+
+For the full architectural rationale, see [docs/vimu/architecture.md](../../docs/vimu/architecture.md).
 
 ## What You Need
 
 ### Hardware
 - **Hobby servo robot** with up to 6 joints (any configuration)
-- **Arduino** (Uno, Mega, Nano — anything with enough PWM pins)
+- **Arduino** with the nuttymoves firmware flashed and calibrated (see [Adelino Control Guide](../../projects/adelino/guides/02-adelino-control.md))
 - **USB webcam** (or laptop camera) with a clear view of the robot
-- **USB cable** for Arduino serial connection
-- **Stable surface** to mount the camera (tripod recommended)
+- **Phone or handheld camera** for filming segmentation videos (Phase 1)
+- **Tripod** for pose data collection (Phase 3)
 
-### Software (already set up if you followed the main README)
-- Python 3.11 with the `vimu` virtual environment
-- Arduino IDE (for uploading the sketch)
-
-## Phase 1: Arduino Setup
-
-### 1.1 Configure the sketch
-
-Open `arduino/data_collection_controller/data_collection_controller.ino` and edit the configuration section at the top:
-
-```cpp
-#define NUM_SERVOS    6    // ← number of joints on YOUR robot
-const uint8_t SERVO_PINS[NUM_SERVOS] = {3, 5, 6, 9, 10, 11};  // ← YOUR pin assignments
-
-#define SERVO_MIN_US  500   // ← minimum pulse width for your servos
-#define SERVO_MAX_US  2500  // ← maximum pulse width for your servos
-```
-
-**How to find your values:**
-- `NUM_SERVOS`: Count the servo motors on your robot.
-- `SERVO_PINS`: Which Arduino digital pins are wired to each servo's signal wire.
-- `SERVO_MIN_US` / `SERVO_MAX_US`: Check your servo datasheet. Most hobby servos use 500–2500μs. Some use 1000–2000μs. Using wrong values can damage servos or cause jitter.
-
-### 1.2 Upload to Arduino
-
-1. Open the `.ino` file in Arduino IDE.
-2. Select your board and port.
-3. Upload.
-4. Note the serial port name (e.g., `COM3` on Windows, `/dev/ttyUSB0` on Linux).
-
-### 1.3 Verify connection
-
-After upload, the built-in LED should blink 3 times. The sketch is now listening for binary commands at 500000 baud.
-
-## Phase 2: Collect Training Data
-
-### 2.1 Configure joint ranges
-
-Open `training/collect.py` and edit `DEFAULT_JOINT_RANGES` to match your robot's mechanical limits:
-
-```python
-DEFAULT_JOINT_RANGES = [
-    (-1.2, 1.2),   # Joint 1 — (min_radians, max_radians)
-    (-0.8, 1.2),   # Joint 2
-    (-1.0, 1.0),   # Joint 3
-    (-1.2, 1.2),   # Joint 4
-    (-1.5, 1.5),   # Joint 5
-    (-0.8, 0.8),   # Joint 6
-]
-```
-
-**Important:** These ranges must stay within what your servos can physically reach. Going beyond mechanical limits will stall servos and produce bad training data. Start conservative and widen later if needed.
-
-### 2.2 Set up the camera
-
-Position the camera so the **entire robot is visible in frame** at all possible poses. Tips:
-- Use a fixed mount — the camera must not move between collection and inference.
-- Good, even lighting (avoid harsh shadows that change with arm position).
-- Plain background if possible (less visual noise for the model).
-- The robot should fill roughly 30–60% of the frame.
-
-### 2.3 Activate the Python environment
+### Software
 
 ```bash
-pyenv-venv activate vimu
-cd training/
+# PyTorch (check https://pytorch.org/get-started/locally/ for your CUDA version)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+# Dependencies
+pip install opencv-python pandas numpy onnx onnxruntime-gpu
+pip install websocket-client        # for collect_pose.py
+pip install transformers peft       # DINOv2 + LoRA
+pip install ultralytics             # YOLO11n-seg
+pip install git+https://github.com/facebookresearch/sam2.git  # Phase 1 only
+
+# Rust toolchain for inference: https://rustup.rs
 ```
 
-### 2.4 Run automated sweep collection
+## Configuration
+
+Copy the env sample and edit to match your setup:
 
 ```bash
-python collect.py sweep \
-    --serial COM3 \
-    --camera 0 \
-    --num-joints 6 \
-    --num-poses 1500 \
-    --settle 0.6 \
-    --output-dir ./data
+cd vimu/training/
+cp .env.sample .env
 ```
 
-**Parameters:**
-| Parameter | What it does | Recommended value |
-|-----------|-------------|-------------------|
-| `--serial` | Arduino serial port | `COM3` (Windows) or `/dev/ttyUSB0` (Linux) |
-| `--camera` | Camera device index | `0` (default webcam), `1`, `2`... |
-| `--num-joints` | Must match `NUM_SERVOS` in the Arduino sketch | Your joint count |
-| `--num-poses` | Total training frames to collect | 1500–3000 for good results |
-| `--settle` | Seconds to wait after each servo command | 0.4–0.8 (heavier robots need more) |
-| `--output-dir` | Where to save frames + labels | `./data` |
+Edit `.env` to set your video directory and output paths. All commands below assume `.env` is configured, so you can omit `--video-dir` and `--output` flags.
 
-**What happens:**
-1. The script connects to the Arduino and opens the camera.
-2. For each pose, it sends random joint angles (within your ranges) to the servos.
-3. Waits for settle time (servos stop vibrating).
-4. Captures a frame and saves it as a JPEG.
-5. Writes the commanded angles to `labels.csv`.
-6. Shows a preview window — press `q` to stop early.
+## Phase 1: Collect Segmentation Data
 
-**Expected time:** ~1500 poses × 0.6s settle ≈ **15 minutes**.
+Film the robot from various angles and environments. No servo control needed -- the robot just sits there in static poses. Use your phone or a handheld camera at 30fps.
 
-**Output:**
-```
-data/
-├── frames/
-│   ├── 000000.jpg
-│   ├── 000001.jpg
-│   └── ... (1500 files)
-└── labels.csv
-```
+Tips for good segmentation data:
+- Orbit around the robot at different heights (table level, above, below)
+- Film in multiple rooms/lighting conditions
+- Put the robot in 3-5 different manual poses and orbit each
+- 30-60 seconds per video clip, 10-20 clips total
 
-### 2.5 (Optional) Add tilted base samples
+Save videos to the directory configured in `.env` (default: `./adelino_v1/`).
 
-If you want the model to also estimate base orientation (e.g., when the robot is on an uneven surface):
+### Annotate
 
 ```bash
-python collect.py tilted \
-    --camera 0 \
-    --num-joints 6 \
-    --output-dir ./data
+python annotate_seg.py --annotate-only
 ```
 
-This is interactive: physically tilt the robot, press SPACE to capture, and enter the angles manually. You need a protractor or IMU to know the actual tilt. Skip this if you only need joint angles.
+For each video, the first frame appears. Place points on the robot:
+- **Left-click** = foreground (green dot) -- place 5-10 on distinct robot parts
+- **Right-click** = background (red dot) -- place on objects SAM2 might confuse for the robot
+- **Ctrl+Z** = undo last point
+- **Enter** = accept
+- **q** = skip video
 
-### 2.6 Verify your data
+Annotations are saved to `annotations.json` per video. Re-running loads saved points for editing.
 
-Check that `data/labels.csv` has the right number of rows and that images look correct:
+### Process
 
 ```bash
-python -c "
-import pandas as pd
-df = pd.read_csv('./data/labels.csv')
-print(f'Frames: {len(df)}')
-print(f'Columns: {list(df.columns)}')
-print(df.describe())
-"
+# Run with large model (default, best quality)
+python annotate_seg.py --process-only
+
+# Or compare with a faster model
+python annotate_seg.py --process-only --model tiny
 ```
 
-You should see `frame`, `joint_1` through `joint_N`, `base_roll`, `base_pitch` columns. Joint values should be within your configured ranges.
+Available models: `tiny` (fastest), `small`, `base_plus`, `large` (best, default).
 
-## Phase 3: Train the Model
-
-### 3.1 Start training
+### Check status
 
 ```bash
-python train.py \
-    --data-dir ./data \
-    --num-joints 6 \
-    --epochs 100 \
-    --batch-size 32
+python annotate_seg.py --status
 ```
 
-**Parameters:**
-| Parameter | What it does | Default |
-|-----------|-------------|---------|
-| `--data-dir` | Path to your collected data | (required) |
-| `--num-joints` | Must match collection | 6 |
-| `--epochs` | Training iterations over full dataset | 100 |
-| `--batch-size` | Images per gradient step | 32 (lower if you run out of GPU memory) |
-| `--lr` | Learning rate | 0.001 |
-| `--val-split` | Fraction held out for validation | 0.15 |
-| `--output-dir` | Where to save checkpoints | `./checkpoints` |
+Shows which videos are annotated, which models have been run, and frame counts.
 
-### 3.2 What to expect
+### Review and iterate
 
-The training loop prints per-epoch stats:
+- Bad video? Delete its folder in `seg_data/<video_name>/` and re-run
+- Bad masks from one model? Delete `seg_data/<video_name>/masks/<model>/` and re-process
+- Want to refine points? Run `--annotate-only` again -- saved points are pre-loaded
+
+### Output
 
 ```
-Epoch   1/100 (12.3s) | Loss 0.2841 | Joint MAE 0.4123 (23.6°) | Base MAE 0.0012 | LR 1.00e-03
-Epoch   2/100 (11.8s) | Loss 0.1923 | Joint MAE 0.3012 (17.3°) | ...
-...
-Epoch  50/100 (11.5s) | Loss 0.0089 | Joint MAE 0.0654 (3.7°)  | ...
-Epoch 100/100 (11.4s) | Loss 0.0045 | Joint MAE 0.0412 (2.4°)  | ...
+seg_data/
+    <video_name>/
+        annotations.json            # click points (shared across models)
+        frames/*.jpg                # extracted video frames
+        masks/
+            large/*.png             # masks from SAM2-large
+            tiny/*.png              # masks from SAM2-tiny
 ```
 
-**Target: Joint MAE under 5° (0.087 rad).** If you reach this, the model is good. Under 3° is excellent.
-
-**Typical timelines:**
-- With GPU (CUDA): ~12s/epoch → **~20 min** for 100 epochs
-- CPU only: ~60s/epoch → **~1.5 hours** for 100 epochs
-
-### 3.3 If training isn't converging
-
-| Symptom | Likely cause | Fix |
-|---------|-------------|-----|
-| MAE stuck above 15° | Too few training samples | Collect more poses (3000+) |
-| MAE stuck above 10° | Camera moved during collection | Recollect with fixed camera |
-| MAE oscillating wildly | Learning rate too high | Add `--lr 0.0003` |
-| Loss is NaN | Bad data (corrupted images) | Check `data/frames/` for broken JPEGs |
-| GPU out of memory | Batch size too large | Try `--batch-size 16` or `--batch-size 8` |
-
-### 3.4 Output
-
-Training saves to `checkpoints/`:
-```
-checkpoints/
-├── best.pt    ← best validation MAE (this is what you export)
-└── log.csv    ← per-epoch metrics for plotting
-```
-
-## Phase 4a: Export to ONNX
-
-### 4.1 Export
+## Phase 2: Train Segmentor
 
 ```bash
-python export_onnx.py \
-    --checkpoint ./checkpoints/best.pt \
-    --output ./vimu.onnx
+python train_segmentor.py --data seg_data/ --output vimu_seg.pt --epochs 50
 ```
 
-### 4.2 What it produces
+Target: >95% mIoU on held-out frames.
 
-```
-vimu.onnx   ← the model (inference engine loads this)
-vimu.json   ← metadata (dimension names, normalization constants)
-```
+## Phase 3: Collect Pose Data
 
-### 4.3 Verify the export
-
-The script automatically:
-1. Validates the ONNX file structure.
-2. Runs a test inference with random input.
-3. Checks output shape matches expectations.
-
-If it prints "ONNX validated" — you're good.
-
-## Phase 4b: Run Inference
+Start the controller, then collect from multiple camera angles:
 
 ```bash
-cd ../inference
-cargo run --release --features camera -- \
-    --model ../training/vimu.onnx \
-    --camera 0 \
-    --port 9001 \
-    --display
+# Terminal 1: start controller
+cd projects/adelino
+cargo run --release -p adelino-standalone -- run --port COM3 --calibration calibration.toml
+
+# Terminal 2: collect pose data
+cd vimu/training/
+
+# First angle
+python collect_pose.py sweep \
+    --calibration ../../projects/adelino/target/release/calibration.toml \
+    --seg-model vimu_seg.pt \
+    --camera 0 --num-poses 500
+
+# Move tripod, then append from a new angle
+python collect_pose.py sweep \
+    --calibration ../../projects/adelino/target/release/calibration.toml \
+    --seg-model vimu_seg.pt \
+    --camera 0 --num-poses 500 --append
 ```
 
-You should see a preview window with joint angle overlays and FPS counter. Connect a WebSocket client to `ws://localhost:9001` to receive the state stream.
+Repeat from 3-5 different camera positions. The segmentor strips backgrounds live, so the pose model trains on clean masked images.
+
+## Phase 4: Train Pose Model
+
+```bash
+python train.py --data ./pose_data --epochs 100
+```
+
+Target: joint MAE under 3 degrees (0.05 rad). The number of joints is auto-detected from `labels.csv`.
+
+| Symptom | Fix |
+|---------|-----|
+| MAE stuck above 15 degrees | Collect more poses (3000+) |
+| MAE stuck above 10 degrees | Check segmentor quality, re-collect if masks are noisy |
+| MAE oscillating | Lower learning rate (`--lr 0.0003`) |
+| GPU out of memory | Lower batch size (`--batch-size 16`) |
+
+## Phase 5: Export to ONNX
+
+```bash
+python export_onnx.py --checkpoint checkpoints/best.pt --output vimu_pose.onnx
+python export_seg.py --model vimu_seg.pt --output vimu_seg.onnx
+```
+
+## Phase 6: Run Inference
+
+```bash
+cd inference/
+cargo build --release --features camera
+
+./target/release/vimu \
+    --model ../training/vimu_pose.onnx \
+    --seg-model ../training/vimu_seg.onnx \
+    --camera 0 --port 9001 --display
+```
+
+Connect a WebSocket client to `ws://localhost:9001` to receive the state stream.
 
 ## Quick Reference
 
-```
-# Full pipeline from scratch:
-pyenv-venv activate vimu
-cd training/
+```bash
+cd vimu/training/
 
-# 1. Collect (~15 min)
-python collect.py sweep --serial COM3 --camera 0 --num-joints 6 --num-poses 1500 --output-dir ./data
+# Phase 1: Annotate + process segmentation data
+python annotate_seg.py --annotate-only
+python annotate_seg.py --process-only
+python annotate_seg.py --status
 
-# 2. Train (~20 min with GPU)
-python train.py --data-dir ./data --num-joints 6 --epochs 100
+# Phase 2: Train segmentor (~10 min)
+python train_segmentor.py --data seg_data/ --output vimu_seg.pt
 
-# 3. Export (<1 min)
-python export_onnx.py --checkpoint ./checkpoints/best.pt --output ./vimu.onnx
+# Phase 3: Collect pose data (~5 min per angle, repeat 3-5 times)
+python collect_pose.py sweep --calibration calibration.toml --seg-model vimu_seg.pt --camera 0 --num-poses 500
 
-# 4. Run inference
-cd ../inference
-cargo run --release --features camera -- --model ../training/vimu.onnx --camera 0 --port 9001 --display
+# Phase 4: Train pose model (~20 min with GPU)
+python train.py --data ./pose_data --epochs 100
+
+# Phase 5: Export (~1 min)
+python export_onnx.py --checkpoint checkpoints/best.pt --output vimu_pose.onnx
+python export_seg.py --model vimu_seg.pt --output vimu_seg.onnx
+
+# Phase 6: Run inference
+cd ../inference && cargo run --release --features camera -- --model ../training/vimu_pose.onnx --seg-model ../training/vimu_seg.onnx --camera 0 --port 9001 --display
 ```
