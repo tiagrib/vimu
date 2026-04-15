@@ -61,7 +61,16 @@ The calibration TOML is used throughout the VIMU pipeline to know how many joint
 
 ```bash
 # Python (all phases)
-pip install torch torchvision opencv-python pandas numpy onnx onnxruntime-gpu
+# Check https://pytorch.org/get-started/locally/ for your specific PyTorch install command based on your CUDA version
+
+# Windows + CUDA 13:
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# Linux + CUDA 13:
+pip3 install torch torchvision
+
+# Then other dependencies:
+pip install opencv-python pandas numpy onnx onnxruntime-gpu
 pip install websocket-client   # for collect_pose.py
 pip install transformers peft  # DINOv2 + LoRA
 pip install ultralytics        # YOLO11n-seg
