@@ -70,14 +70,10 @@ Annotations are saved to `annotations.json` per video. Re-running loads saved po
 ### Process
 
 ```bash
-# Run with large model (default, best quality)
 python annotate_seg.py --process-only
-
-# Or compare with a faster model
-python annotate_seg.py --process-only --model tiny
 ```
 
-Available models: `tiny` (fastest), `small`, `base_plus`, `large` (best, default).
+This runs SAM2-large by default, which gives the best mask quality. If your GPU can handle it (needs ~3-4 GB VRAM), stick with `large` -- there's no reason to use a smaller model unless you're constrained on VRAM or processing time. Smaller models are available (`--model tiny`, `small`, `base_plus`) but will produce lower quality masks that propagate into every downstream phase.
 
 ### Check status
 
@@ -105,11 +101,54 @@ seg_data/
             tiny/*.png              # masks from SAM2-tiny
 ```
 
+### Verify: Compare masks
+
+Before moving on, visually verify the segmentation quality across all videos:
+
+```bash
+python compare_masks.py
+```
+
+This generates a grid image per model in `seg_data/comparison/`. Each video's masks are stacked into a single frame with a yellow-to-blue gradient (first frame = yellow, last = blue), so you can see at a glance:
+- **Solid, consistent shape** = good tracking throughout the video
+- **Scattered or fading color** = mask drifted or was lost
+- **Yellow only (no blue)** = tracking failed early
+
+Open the grid image and check every video. If any look bad:
+1. Delete that video's output folder: `rm -rf seg_data/<video_name>/`
+2. Re-annotate with better point placement (`--annotate-only`)
+3. Re-process (`--process-only`)
+
+If you tested multiple models, compare their grid images side by side:
+```bash
+python annotate_seg.py --process-only --model tiny
+python compare_masks.py --models large tiny
+```
+
+**This is the quality gate for Phase 1.** Only proceed to Phase 2 once all videos show clean, consistent masks in the grid.
+
 ## Phase 2: Train Segmentor
 
 ```bash
-python train_segmentor.py --data seg_data/ --output vimu_seg.pt --epochs 50
+python train_segmentor.py
 ```
+
+The script auto-detects the best available model's masks (prefers `large` > `base_plus` > `small` > `tiny`). Before training, it runs a pre-flight check that verifies every annotated video has matching frames and masks, and reports the status:
+
+```
+Pre-flight check (model: large)
+Video                      Frames     Masks  Status
+-----------------------------------------------------------------
+IMG_7975                       152       152  OK
+IMG_7976                        98        98  OK
+IMG_7977                       120         0  MISSING MASKS
+-----------------------------------------------------------------
+Total                          370       250  2 videos OK
+```
+
+If any video has missing or mismatched data, the script aborts with instructions on how to fix it.
+
+To use a specific model's masks: `python train_segmentor.py --model tiny`
 
 Target: >95% mIoU on held-out frames.
 

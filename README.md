@@ -43,6 +43,7 @@ cp .env.sample .env   # configure VIDEO_DIR, OUTPUT_DIR, etc.
 python annotate_seg.py --annotate-only
 python annotate_seg.py --process-only
 python annotate_seg.py --status
+python compare_masks.py              # verify quality before moving on
 
 # Phase 2: Train segmentor
 python train_segmentor.py --data seg_data/ --output vimu_seg.pt
