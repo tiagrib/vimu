@@ -11,8 +11,9 @@ the robot from view, hit 'r', move camera around false positives, hit 'r'
 again). Videos are saved directly to the configured VIDEO_DIR.
 
 Usage:
-    python test_segmentor.py --model vimu_seg.pt
-    python test_segmentor.py --model vimu_seg.pt --camera 1
+    python test_segmentor.py --variant large_600frames
+    python test_segmentor.py --variant large_600frames --camera 1
+    python test_segmentor.py --model /path/to/vimu_seg.pt   # direct path
 
 Controls:
     r = start/stop recording
@@ -25,8 +26,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import cv2
-import numpy as np
+os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+
+from model_paths import get_model_path, list_variants, get_models_dir
 
 
 def load_dotenv():
@@ -44,22 +49,61 @@ def load_dotenv():
         os.environ.setdefault(key.strip(), value.strip())
 
 
+def resolve_model(args) -> Path:
+    """Resolve model path from --variant or --model."""
+    if args.model:
+        p = Path(args.model)
+        if not p.exists():
+            print(f"ERROR: Model file not found: {p}")
+            raise SystemExit(1)
+        return p
+
+    if args.variant:
+        p = get_model_path("segmentation", args.variant, "vimu_seg.pt", args.models_dir)
+        if not p.exists():
+            print(f"ERROR: No vimu_seg.pt found for variant '{args.variant}'")
+            print(f"  Expected: {p}")
+            variants = list_variants("segmentation", args.models_dir)
+            if variants:
+                print(f"  Available variants: {', '.join(variants)}")
+            raise SystemExit(1)
+        return p
+
+    # No --variant or --model: list available and ask
+    variants = list_variants("segmentation", args.models_dir)
+    models_dir = get_models_dir(args.models_dir)
+    if variants:
+        print(f"Available segmentation variants ({models_dir.resolve()}):")
+        for v in variants:
+            print(f"  --variant {v}")
+    else:
+        print(f"No segmentation variants found in {models_dir.resolve()}")
+    print("\nSpecify --variant <name> or --model <path>")
+    raise SystemExit(1)
+
+
 def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="VIMU v2: Live segmentor test")
-    parser.add_argument("--model", default="vimu_seg.pt", help="YOLO segmentor checkpoint")
+    parser.add_argument("--variant", help="Segmentation model variant name")
+    parser.add_argument("--model", help="Direct path to YOLO checkpoint (overrides --variant)")
+    parser.add_argument("--models-dir", default=None, help="Override models directory")
     parser.add_argument("--camera", type=int, default=0, help="Camera device index")
     parser.add_argument("--conf", type=float, default=0.5, help="Detection confidence threshold")
+    parser.add_argument("--fps", type=float, default=0,
+                        help="Camera capture FPS (0 = max supported, default: 0)")
+    parser.add_argument("--resolution", default=None,
+                        help="Camera resolution as WxH (e.g. 1280x720)")
     args = parser.parse_args()
 
+    model_path = resolve_model(args)
     video_dir = Path(os.environ.get("VIDEO_DIR", "./videos"))
 
-    # Detect available cameras (suppress OpenCV probe noise)
-    os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+    # Detect available cameras using DirectShow (fast probe, no errors on Windows)
     available = []
     for i in range(10):
-        cap = cv2.VideoCapture(i)
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         if cap.isOpened():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -80,17 +124,37 @@ def main():
     print(f"\nTo use a different camera: python test_segmentor.py --camera <index>")
 
     from ultralytics import YOLO
-    model = YOLO(args.model)
+    print(f"Loading model: {model_path}\n")
+    model = YOLO(str(model_path))
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
     if not cap.isOpened():
         print(f"ERROR: Cannot open camera {args.camera}")
         return
 
+    # Set MJPEG codec before resolution/fps — many webcams only support
+    # higher framerates (e.g. 60fps) in MJPEG mode, not the default YUY2
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+    if args.resolution:
+        rw, rh = (int(x) for x in args.resolution.split("x"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
+    if args.fps > 0:
+        cap.set(cv2.CAP_PROP_FPS, args.fps)
+
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     camera_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
+    print(f"Camera: {frame_w}x{frame_h} @ {camera_fps:.0f} fps")
+    if args.resolution or args.fps > 0:
+        req_parts = []
+        if args.resolution:
+            req_parts.append(args.resolution)
+        if args.fps > 0:
+            req_parts.append(f"{args.fps:.0f}fps")
+        print(f"  Requested: {', '.join(req_parts)} -> got {frame_w}x{frame_h} @ {camera_fps:.0f} fps")
     print(f"\nControls: r = start/stop recording, q = quit")
     print(f"Recordings save to: {video_dir.resolve()}\n")
 

@@ -5,11 +5,14 @@ Collects frame/mask pairs from the per-video seg_data structure,
 converts binary masks to YOLO polygon format, then fine-tunes YOLO11n-seg.
 
 Usage:
-    # Uses large model masks by default
-    python train_segmentor.py --data seg_data/
+    # Train with a variant name (uses best available SAM2 masks)
+    python train_segmentor.py --variant large_600frames
 
-    # Use a specific model's masks
-    python train_segmentor.py --data seg_data/ --model tiny
+    # Specify which SAM2 masks to use
+    python train_segmentor.py --variant large_600frames --model tiny
+
+    # List existing variants
+    python train_segmentor.py --list
 
 Input:
     seg_data/
@@ -18,7 +21,7 @@ Input:
             masks/<model>/*.png
 
 Output:
-    vimu_seg.pt         # YOLO checkpoint for real-time segmentation
+    <MODELS_DIR>/segmentation/<variant>/vimu_seg.pt
 """
 
 import argparse
@@ -29,6 +32,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+from model_paths import get_variant_dir, list_variants, get_models_dir
 
 SAM2_MODEL_PRIORITY = ["large", "base_plus", "small", "tiny"]
 
@@ -93,7 +98,6 @@ def preflight_check(data_dir: Path, model: str) -> list[tuple[Path, Path]]:
         ann_path = video_dir / "annotations.json"
 
         if not ann_path.exists():
-            # Not annotated — skip silently
             continue
 
         n_frames = len(list(frames_dir.glob("*.jpg"))) if frames_dir.exists() else 0
@@ -145,12 +149,10 @@ def mask_to_yolo_polygon(mask: np.ndarray) -> str | None:
     if not contours:
         return None
 
-    # Use the largest contour
     contour = max(contours, key=cv2.contourArea)
     if cv2.contourArea(contour) < 100:
         return None
 
-    # Simplify to reduce point count
     epsilon = 0.005 * cv2.arcLength(contour, True)
     contour = cv2.approxPolyDP(contour, epsilon, True)
 
@@ -170,7 +172,6 @@ def prepare_yolo_dataset(
     val_split: float = 0.15,
 ) -> Path:
     """Convert per-video frame/mask pairs to YOLO segmentation format."""
-    # Collect all pairs across videos
     pairs = []
     for frames_dir, masks_dir in video_pairs:
         video_name = frames_dir.parent.name
@@ -185,13 +186,11 @@ def prepare_yolo_dataset(
 
     print(f"Preparing {len(pairs)} frame/mask pairs for YOLO training...")
 
-    # Split
     np.random.seed(42)
     indices = np.random.permutation(len(pairs))
     val_n = int(len(pairs) * val_split)
     val_indices = set(indices[:val_n])
 
-    # Create YOLO directory structure
     if yolo_dir.exists():
         shutil.rmtree(yolo_dir)
     for split in ("train", "val"):
@@ -201,13 +200,10 @@ def prepare_yolo_dataset(
     skipped = 0
     for i, (frame_path, mask_path, video_name) in enumerate(pairs):
         split = "val" if i in val_indices else "train"
-        # Use video_name prefix to avoid filename collisions across videos
         name = f"{video_name}_{frame_path.stem}"
 
-        # Copy image
         shutil.copy2(frame_path, yolo_dir / "images" / split / f"{name}.jpg")
 
-        # Convert mask to polygon label
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         label = mask_to_yolo_polygon(mask)
         if label is None:
@@ -222,7 +218,6 @@ def prepare_yolo_dataset(
     if skipped:
         print(f"  Skipped {skipped} frames with no valid contour")
 
-    # Create dataset YAML
     yaml_path = yolo_dir / "dataset.yaml"
     yaml_path.write_text(
         f"path: {yolo_dir.resolve()}\n"
@@ -239,30 +234,66 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="VIMU v2: Train YOLO segmentor")
+    parser.add_argument("--variant", help="Variant identifier (e.g. large_600frames)")
     parser.add_argument("--data", default=os.environ.get("OUTPUT_DIR", "./seg_data"),
                         help="Path to seg_data/ directory")
     parser.add_argument("--model", default=os.environ.get("MODEL"),
                         help="Which SAM2 model's masks to use (default: best available)")
-    parser.add_argument("--output", default="vimu_seg.pt", help="Output checkpoint path")
+    parser.add_argument("--models-dir", default=None,
+                        help="Override models directory")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--list", action="store_true",
+                        help="List existing segmentation variants")
     args = parser.parse_args()
+
+    # List mode
+    if args.list:
+        variants = list_variants("segmentation", args.models_dir)
+        models_dir = get_models_dir(args.models_dir)
+        print(f"Models dir: {models_dir.resolve()}")
+        if variants:
+            print(f"\nSegmentation variants:")
+            for v in variants:
+                vdir = models_dir / "segmentation" / v
+                has_pt = (vdir / "vimu_seg.pt").exists()
+                has_onnx = (vdir / "vimu_seg.onnx").exists()
+                files = []
+                if has_pt:
+                    files.append(".pt")
+                if has_onnx:
+                    files.append(".onnx")
+                print(f"  {v:30s}  [{', '.join(files)}]")
+        else:
+            print("\nNo segmentation variants found.")
+        return
+
+    if not args.variant:
+        parser.error("--variant is required (e.g. --variant large_600frames). Use --list to see existing variants.")
 
     data_dir = Path(args.data)
 
-    # Determine which model's masks to use
-    model = args.model
-    if not model:
-        model = detect_best_model(data_dir)
-        if not model:
+    # Determine which SAM2 model's masks to use
+    sam2_model = args.model
+    if not sam2_model:
+        sam2_model = detect_best_model(data_dir)
+        if not sam2_model:
             print("ERROR: No masks found in any video folder.")
             sys.exit(1)
-        print(f"Auto-detected best model: {model}\n")
+        print(f"Auto-detected best SAM2 masks: {sam2_model}\n")
 
     # Pre-flight check
-    video_pairs = preflight_check(data_dir, model)
+    video_pairs = preflight_check(data_dir, sam2_model)
+
+    # Resolve output path
+    variant_dir = get_variant_dir("segmentation", args.variant, args.models_dir)
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    output_path = variant_dir / "vimu_seg.pt"
+
+    print(f"Variant: {args.variant}")
+    print(f"Output:  {variant_dir.resolve()}\n")
 
     # Prepare YOLO dataset
     yolo_dir = data_dir / "_yolo_format"
@@ -284,15 +315,17 @@ def main():
     # Copy best checkpoint
     best_path = Path(results.save_dir) / "weights" / "best.pt"
     if best_path.exists():
-        shutil.copy2(best_path, args.output)
-        print(f"\nSaved best checkpoint to {args.output}")
+        shutil.copy2(best_path, output_path)
+        print(f"\nSaved best checkpoint to {output_path}")
     else:
         last_path = Path(results.save_dir) / "weights" / "last.pt"
         if last_path.exists():
-            shutil.copy2(last_path, args.output)
-            print(f"\nSaved last checkpoint to {args.output}")
+            shutil.copy2(last_path, output_path)
+            print(f"\nSaved last checkpoint to {output_path}")
 
-    print(f"Next step: python collect_pose.py --seg-model {args.output} ...")
+    print(f"\nNext steps:")
+    print(f"  Test:    python test_segmentor.py --variant {args.variant}")
+    print(f"  Export:  python export_seg.py --variant {args.variant}")
 
 
 if __name__ == "__main__":

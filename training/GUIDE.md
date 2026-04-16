@@ -127,13 +127,35 @@ python compare_masks.py --models large tiny
 
 **This is the quality gate for Phase 1.** Only proceed to Phase 2 once all videos show clean, consistent masks in the grid.
 
+## Model Organization
+
+All trained models are stored under a shared `models/` directory (at the repo root by default, or override with `MODELS_DIR` in `.env`). Models are organized by family and variant:
+
+```
+models/
+  segmentation/                     # family
+    large_600frames/                # variant (you choose the name)
+      vimu_seg.pt                   # YOLO checkpoint
+      vimu_seg.onnx                 # exported ONNX (Phase 5)
+    diverse_lighting/               # another variant
+      vimu_seg.pt
+  pose/                             # future family
+    dinov2_v1/
+      best.pt
+      vimu_pose.onnx
+```
+
+List existing variants: `python train_segmentor.py --list`
+
 ## Phase 2: Train Segmentor
 
 ```bash
-python train_segmentor.py
+python train_segmentor.py --variant large_600frames
 ```
 
-The script auto-detects the best available model's masks (prefers `large` > `base_plus` > `small` > `tiny`). Before training, it runs a pre-flight check that verifies every annotated video has matching frames and masks, and reports the status:
+You choose the variant name -- it should describe what's distinctive about this training run (e.g. `large_600frames`, `diverse_lighting`, `neg_examples_v2`).
+
+The script auto-detects the best available SAM2 masks (prefers `large` > `base_plus` > `small` > `tiny`). Before training, it runs a pre-flight check that verifies every annotated video has matching frames and masks:
 
 ```
 Pre-flight check (model: large)
@@ -148,7 +170,7 @@ Total                          370       250  2 videos OK
 
 If any video has missing or mismatched data, the script aborts with instructions on how to fix it.
 
-To use a specific model's masks: `python train_segmentor.py --model tiny`
+To use a specific SAM2 model's masks: `python train_segmentor.py --variant my_variant --model tiny`
 
 ### Reading the training output
 
@@ -190,7 +212,7 @@ YOLO prints several metrics per epoch. Here's what they mean:
 Before moving to pose data collection, test the segmentor live on camera:
 
 ```bash
-python test_segmentor.py --model vimu_seg.pt
+python test_segmentor.py --variant large_600frames
 ```
 
 This opens a camera window with a green overlay on the detected robot and an FPS counter. Walk around with the camera, change lighting, move to different rooms -- the segmentor should reliably detect and mask the robot in all conditions it will encounter during Phase 3 and inference.
@@ -279,7 +301,9 @@ python annotate_seg.py --process-only
 python annotate_seg.py --status
 
 # Phase 2: Train segmentor (~10 min)
-python train_segmentor.py --data seg_data/ --output vimu_seg.pt
+python train_segmentor.py --variant my_variant
+python test_segmentor.py --variant my_variant
+python train_segmentor.py --list                    # see all variants
 
 # Phase 3: Collect pose data (~5 min per angle, repeat 3-5 times)
 python collect_pose.py sweep --calibration calibration.toml --seg-model vimu_seg.pt --camera 0 --num-poses 500
@@ -289,7 +313,7 @@ python train.py --data ./pose_data --epochs 100
 
 # Phase 5: Export (~1 min)
 python export_onnx.py --checkpoint checkpoints/best.pt --output vimu_pose.onnx
-python export_seg.py --model vimu_seg.pt --output vimu_seg.onnx
+python export_seg.py --variant my_variant
 
 # Phase 6: Run inference
 cd ../inference && cargo run --release --features camera -- --model ../training/vimu_pose.onnx --seg-model ../training/vimu_seg.onnx --camera 0 --port 9001 --display
