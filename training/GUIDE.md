@@ -150,7 +150,58 @@ If any video has missing or mismatched data, the script aborts with instructions
 
 To use a specific model's masks: `python train_segmentor.py --model tiny`
 
-Target: >95% mIoU on held-out frames.
+### Reading the training output
+
+YOLO prints several metrics per epoch. Here's what they mean:
+
+**Losses (lower is better):**
+
+| Loss | What it measures |
+|------|-----------------|
+| `box_loss` | How well the predicted bounding box matches the ground truth (CIoU loss) |
+| `seg_loss` | How well the predicted mask matches the ground truth mask (binary cross-entropy) |
+| `cls_loss` | Classification confidence -- since we only have one class ("robot"), this drops fast |
+| `dfl_loss` | Distribution focal loss -- refines bounding box edge precision |
+
+`sem_loss` is semantic segmentation loss (unused in instance segmentation mode, always 0).
+
+**Validation metrics (higher is better):**
+
+| Metric | What it measures | Target |
+|--------|-----------------|--------|
+| `Box(P)` | Bounding box precision (% of predictions that are correct) | >0.95 |
+| `R` | Recall (% of ground truth objects found) | 1.0 |
+| `mAP50` | Mean Average Precision at 50% IoU overlap | >0.99 |
+| `mAP50-95` | mAP averaged across IoU thresholds 50%-95% (stricter) | >0.90 |
+| `Mask(P)` | Same as Box(P) but for the segmentation mask | >0.95 |
+| `Mask mAP50` | Mask quality at 50% IoU | >0.99 |
+| `Mask mAP50-95` | Mask quality across IoU thresholds (the key metric) | >0.85 |
+
+**What good training looks like:**
+- `seg_loss` and `box_loss` should decrease steadily
+- `Mask mAP50` should reach 0.99+ (SAM2 masks are high quality, so YOLO learns quickly)
+- `Mask mAP50-95` above 0.85 means the masks are tight, not just roughly correct
+- If `R` stays at 1.0, the model never misses the robot -- that's what matters most
+
+**Your results look excellent** -- `mAP50: 0.995` and `Mask mAP50-95: 0.836` at epoch 24 is already very good for this task.
+
+### Verify: Live segmentor test
+
+Before moving to pose data collection, test the segmentor live on camera:
+
+```bash
+python test_segmentor.py --model vimu_seg.pt
+```
+
+This opens a camera window with a green overlay on the detected robot and an FPS counter. Walk around with the camera, change lighting, move to different rooms -- the segmentor should reliably detect and mask the robot in all conditions it will encounter during Phase 3 and inference.
+
+**What to check:**
+- Robot is detected at all angles you plan to collect pose data from
+- Mask is tight around the robot, not bleeding onto background objects
+- No false positives (random objects detected as robot)
+- Detection stays stable when you move the camera quickly
+
+Press `q` to quit. If the segmentor struggles in certain conditions, go back to Phase 1 and add more segmentation videos from those conditions.
 
 ## Phase 3: Collect Pose Data
 
