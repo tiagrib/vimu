@@ -201,7 +201,9 @@ This opens a camera window with a green overlay on the detected robot and an FPS
 - No false positives (random objects detected as robot)
 - Detection stays stable when you move the camera quickly
 
-Press `q` to quit. If the segmentor struggles in certain conditions, go back to Phase 1 and add more segmentation videos from those conditions.
+**Controls:** `q` = quit, `r` = start/stop recording.
+
+**If you see false positives or bleeding:** remove the robot from view, press `r` to start recording, move the camera around the problem areas, press `r` to stop. The video is saved directly to your video directory (from `.env`) as a negative example. Then re-run Phase 1 annotation on the new video (skip it with `n` since there's no robot to annotate -- this produces frames with no labels, teaching YOLO "nothing here"), re-process, and retrain.
 
 ## Phase 3: Collect Pose Data
 
