@@ -241,6 +241,8 @@ def main():
                         help="Which SAM2 model's masks to use (default: best available)")
     parser.add_argument("--models-dir", default=None,
                         help="Override models directory")
+    parser.add_argument("--base", default="yolo11n-seg.pt",
+                        help="Base YOLO model to fine-tune (default: yolo11n-seg.pt)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
@@ -299,10 +301,10 @@ def main():
     yolo_dir = data_dir / "_yolo_format"
     yaml_path = prepare_yolo_dataset(video_pairs, yolo_dir, args.val_split)
 
-    print(f"Training YOLO11n-seg for {args.epochs} epochs...")
+    print(f"Training {args.base} for {args.epochs} epochs...")
     from ultralytics import YOLO
 
-    yolo = YOLO("yolo11n-seg.pt")
+    yolo = YOLO(args.base)
     results = yolo.train(
         data=str(yaml_path),
         epochs=args.epochs,
