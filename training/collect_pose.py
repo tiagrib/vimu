@@ -290,7 +290,9 @@ def collect_sweep(args, joint_ranges: list[dict]):
 
     pose_dir = resolve_pose_data_dir(args)
     masked_dir = os.path.join(pose_dir, "masked")
+    raw_dir = os.path.join(pose_dir, "raw")
     os.makedirs(masked_dir, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
     labels_path = os.path.join(pose_dir, "labels.csv")
     print(f"Pose data dir: {os.path.abspath(pose_dir)}")
 
@@ -374,9 +376,10 @@ def collect_sweep(args, joint_ranges: list[dict]):
                 mask = seg.segment(frame)
                 masked = seg.apply_mask(frame, mask)
 
-                # Save masked frame
+                # Save masked + raw frame (raw kept for later segmentor refinement)
                 fname = f"{idx:06d}.jpg"
                 cv2.imwrite(os.path.join(masked_dir, fname), masked)
+                cv2.imwrite(os.path.join(raw_dir, fname), frame)
 
                 # Write label
                 row = [fname] + [f"{a:.6f}" for a in pose] + ["0.0", "0.0"]
@@ -424,7 +427,9 @@ def collect_tilted(args, joint_ranges: list[dict]):
     num_joints = len(joint_ranges)
     pose_dir = resolve_pose_data_dir(args)
     masked_dir = os.path.join(pose_dir, "masked")
+    raw_dir = os.path.join(pose_dir, "raw")
     os.makedirs(masked_dir, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
     print(f"Pose data dir: {os.path.abspath(pose_dir)}")
 
     cap = open_camera(args)
@@ -472,6 +477,7 @@ def collect_tilted(args, joint_ranges: list[dict]):
                     masked = seg.apply_mask(frame, mask)
                     fname = f"{idx:06d}.jpg"
                     cv2.imwrite(os.path.join(masked_dir, fname), masked)
+                    cv2.imwrite(os.path.join(raw_dir, fname), frame)
 
                     print(f"\nFrame {idx} captured!")
                     joints = []

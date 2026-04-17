@@ -256,6 +256,26 @@ Repeat from 3-5 different camera positions. The segmentor strips backgrounds liv
 
 You can also pass a direct checkpoint with `--seg-model /path/to/vimu_seg.pt` if you want to test one outside the standard `models/` layout.
 
+`collect_pose.py` also saves the unsegmented camera frames to `<POSE_DATA_DIR>/<variant>/raw/` alongside the masked images. These are not used for pose training but are invaluable for the segmentor refinement workflow below if you spot detection errors during or after collection.
+
+### Segmentor Refinement (optional)
+
+If the segmentor misses the robot or includes wrong objects in some frames, you can refine it with just those frames without redoing any video annotation:
+
+1. Copy problem frames from `raw/` to a new folder, e.g. `refinement_v1/`
+2. Annotate each image individually with positive/negative points (same UI as Phase 1):
+   ```bash
+   python annotate_seg.py --images-dir ./refinement_v1/ --annotate-only
+   python annotate_seg.py --images-dir ./refinement_v1/ --process-only
+   ```
+   Output goes to `seg_data/refinement_v1/frames/` + `masks/<model>/`, compatible with the training script.
+3. Finetune from your existing variant so the model preserves what it already learned:
+   ```bash
+   python train_segmentor.py --variant sparse_large_v2 --from-variant sparse_large_v1
+   ```
+   The training picks up both the original video-derived data and the new `refinement_v1/` images automatically.
+4. Verify with `test_segmentor.py --variant sparse_large_v2` and iterate if needed.
+
 ## Phase 4: Train Pose Model
 
 ```bash

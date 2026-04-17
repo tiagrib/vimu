@@ -33,7 +33,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from model_paths import get_variant_dir, list_variants, get_models_dir
+from model_paths import get_variant_dir, list_variants, get_models_dir, get_model_path
 
 SAM2_MODEL_PRIORITY = ["large", "base_plus", "small", "tiny"]
 
@@ -243,6 +243,8 @@ def main():
                         help="Override models directory")
     parser.add_argument("--base", default="yolo11n-seg.pt",
                         help="Base YOLO model to fine-tune (default: yolo11n-seg.pt)")
+    parser.add_argument("--from-variant",
+                        help="Start from an existing trained variant (finetunes its vimu_seg.pt)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
@@ -297,14 +299,27 @@ def main():
     print(f"Variant: {args.variant}")
     print(f"Output:  {variant_dir.resolve()}\n")
 
+    # Resolve base model — either --from-variant (finetune) or --base (fresh start)
+    from_variant = getattr(args, "from_variant", None)
+    if from_variant:
+        base_path = get_model_path("segmentation", from_variant, "vimu_seg.pt", args.models_dir)
+        if not base_path.exists():
+            print(f"ERROR: --from-variant '{from_variant}' not found at {base_path}")
+            sys.exit(1)
+        base_model = str(base_path)
+        print(f"Finetuning from variant: {from_variant}")
+        print(f"  {base_model}\n")
+    else:
+        base_model = args.base
+
     # Prepare YOLO dataset
     yolo_dir = data_dir / "_yolo_format"
     yaml_path = prepare_yolo_dataset(video_pairs, yolo_dir, args.val_split)
 
-    print(f"Training {args.base} for {args.epochs} epochs...")
+    print(f"Training {base_model} for {args.epochs} epochs...")
     from ultralytics import YOLO
 
-    yolo = YOLO(args.base)
+    yolo = YOLO(base_model)
     results = yolo.train(
         data=str(yaml_path),
         epochs=args.epochs,
