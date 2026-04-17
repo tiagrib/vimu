@@ -1,49 +1,64 @@
 """
 VIMU v2 Phase 1: Segmentation Data Annotation with SAM2
 
-Two-step workflow:
-  1. Annotate: click foreground/background points on each video's first frame
-  2. Process: SAM2 propagates masks through all annotated videos in batch
+Unified collection model:
+  Every subdirectory of seg_data/ with a frames/ folder is a "collection".
+  Each collection is either:
+    - sequence mode (default): annotate FIRST frame, SAM2 video-propagates through all frames
+    - nonseq mode: annotate EVERY frame individually, SAM2 image-segments each
+
+  To mark a collection as nonseq, drop an empty `nonseq` file in its folder.
+
+Workflow:
+  1. Populate seg_data/<name>/frames/ either by:
+     - Running with --video-dir: videos are extracted into seg_data/<stem>/frames/
+     - Manually copying frames (e.g. from pose_data/.../raw/) into seg_data/<name>/frames/
+  2. Run --annotate-only to annotate all un-annotated collections
+  3. Run --process-only to generate masks for the chosen SAM2 model
+  4. Train: train_segmentor.py picks up all collections with matching masks
 
 Usage:
-    # Annotate only (no GPU needed)
-    python annotate_seg.py --video-dir ./videos/ --output seg_data/ --annotate-only
-
-    # Process with default model (large)
-    python annotate_seg.py --video-dir ./videos/ --output seg_data/ --process-only
-
-    # Process with a specific model
-    python annotate_seg.py --video-dir ./videos/ --output seg_data/ --process-only --model tiny
-
-    # Both (default): annotate then process
+    # Extract frames from videos + annotate + process (full Phase 1)
     python annotate_seg.py --video-dir ./videos/ --output seg_data/
 
-    # Still-image refinement: annotate a folder of problem frames individually
-    python annotate_seg.py --images-dir ./refinement_frames/ --name refinement_v1
+    # Just annotate existing collections
+    python annotate_seg.py --annotate-only
+
+    # Just process (generate masks)
+    python annotate_seg.py --process-only
+
+    # Specify SAM2 model variant for processing
+    python annotate_seg.py --process-only --model tiny
+
+    # Refinement: manually populate seg_data/refinement_v1/frames/ then:
+    python annotate_seg.py            # picks it up automatically
+
+    # Mark a collection as per-frame annotation mode:
+    touch seg_data/refinement_v1/nonseq
+    python annotate_seg.py
 
 Controls (annotation):
     L-click     = add foreground point (green)
     R-click     = add background point (red)
     Ctrl+Z      = undo last point
     Enter       = accept annotation
-    n           = skip video
-    q           = quit annotation
+    n / q       = skip / quit
 
 Models:
     tiny        = sam2.1_hiera_t  (fastest, ~156MB)
-    small       = sam2.1_hiera_s  (~~350MB)
+    small       = sam2.1_hiera_s  (~350MB)
     base_plus   = sam2.1_hiera_b+ (~350MB)
     large       = sam2.1_hiera_l  (best quality, ~900MB, default)
 
 Output:
     seg_data/
-        <video_name>/
-            annotations.json        # saved click points (shared across models)
-            frames/*.jpg            # extracted video frames (shared across models)
+        <collection>/
+            frames/*.jpg            # source frames (from video or manual)
+            annotations.json        # click points (list for seq, dict for nonseq)
+            nonseq                  # optional marker file — presence = per-frame mode
             masks/
-                large/*.png         # masks from large model
-                tiny/*.png          # masks from tiny model
-                ...
+                large/*.png
+                tiny/*.png
 """
 
 import argparse
@@ -316,261 +331,270 @@ def show_preview(frame: np.ndarray, mask: np.ndarray, window: str = "Mask Previe
     cv2.imshow(window, overlay)
 
 
-# --- Workflow steps ---
+# --- Unified collection workflow ---
 
-def annotate_videos(videos: list[str], output_dir: Path):
-    """Step 1: Annotate all videos interactively. Saves points to JSON."""
-    annotated = 0
-    for video_path in videos:
-        video_name = Path(video_path).stem
-        video_out = output_dir / video_name
-        ann_path = video_out / "annotations.json"
-
-        existing = load_annotations(ann_path)
-        status = f"({len(existing)} pts saved)" if existing else "(new)"
-        print(f"\nAnnotating: {video_name} {status}")
-
-        frame = extract_first_frame(video_path)
-        if frame is None:
-            print("  Cannot read video, skipping")
-            continue
-
-        points = get_click_points(frame, existing=existing, window_name=f"Annotate: {video_name}")
-        if points is None:
-            print("  Skipped")
-            continue
-
-        save_annotations(points, ann_path)
-        fg = sum(1 for _, _, l in points if l == 1)
-        bg = len(points) - fg
-        print(f"  Saved {fg} fg + {bg} bg points")
-        annotated += 1
-
-    cv2.destroyAllWindows()
-    print(f"\nAnnotation done: {annotated}/{len(videos)} videos annotated")
+SKIP_DIRS = {"_yolo_format", "comparison", "_tmp_sam2_frames"}
 
 
-def process_videos(videos: list[str], output_dir: Path, every_n: int, device: str, model_name: str):
-    """Step 2: Run SAM2 on all annotated videos."""
-    to_process = []
-    for video_path in videos:
-        video_name = Path(video_path).stem
-        video_out = output_dir / video_name
-        ann_path = video_out / "annotations.json"
-        model_masks_dir = video_out / "masks" / model_name
-
-        if not ann_path.exists():
-            continue
-        if model_masks_dir.exists() and list(model_masks_dir.glob("*.png")):
-            print(f"  Skipping {video_name} ({model_name} masks exist, delete to redo)")
-            continue
-        to_process.append((video_path, video_out, ann_path))
-
-    if not to_process:
-        print("No videos to process (all done or none annotated)")
-        return
-
-    print(f"\n{len(to_process)} videos to process with model '{model_name}'. Loading...")
-    predictor = load_sam2(model_name, device)
-
-    for video_path, video_out, ann_path in to_process:
-        video_name = Path(video_path).stem
-        print(f"\nProcessing: {video_name}")
-
-        points = load_annotations(ann_path)
-        frames_dir = video_out / "frames"
-
-        # Reuse saved frames if available
-        if frames_dir.exists() and list(frames_dir.glob("*.jpg")):
-            print("  Loading saved frames...")
-            frames = load_frames(frames_dir)
-        else:
-            frames = extract_frames(video_path, every_n)
-            if not frames:
-                print("  No frames extracted, skipping")
-                continue
-            print("  Saving frames...")
-            save_frames(frames, frames_dir)
-
-        print(f"  Propagating mask from {len(points)} points ({model_name})...")
-        tmp_dir = output_dir / "_tmp_sam2_frames"
-        masks = propagate_masks(predictor, frames, points, tmp_dir, device=device)
-
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-
-        # Preview
-        print("  Showing preview (press any key to accept, 'q' to discard)...")
-        discard = False
-        for i in range(0, len(frames), max(1, len(frames) // 10)):
-            if masks[i] is not None:
-                show_preview(frames[i], masks[i])
-                key = cv2.waitKey(500) & 0xFF
-                if key == ord("q"):
-                    print("  Discarded by user")
-                    discard = True
-                    break
-        cv2.destroyAllWindows()
-
-        if discard:
-            continue
-
-        model_masks_dir = video_out / "masks" / model_name
-        count = save_masks(masks, model_masks_dir)
-        print(f"  Saved {count} masks → masks/{model_name}/")
-
-    print("\nProcessing complete!")
-
-
-# --- Still-image workflow (for segmentor refinement) ---
-
-def _find_images(images_dir: Path) -> list[Path]:
-    """Find all image files in a directory (jpg/jpeg/png)."""
+def _find_images(d: Path) -> list[Path]:
+    """List image files in a directory (jpg/jpeg/png)."""
     exts = {".jpg", ".jpeg", ".png"}
+    if not d.exists():
+        return []
     return sorted(
-        p for p in images_dir.iterdir()
+        p for p in d.iterdir()
         if p.is_file() and p.suffix.lower() in exts
     )
 
 
-def annotate_images(images_dir: Path, output_dir: Path, collection_name: str):
-    """Annotate a folder of still images. Each image gets its own click points."""
-    image_paths = _find_images(images_dir)
-    if not image_paths:
-        print(f"ERROR: No images found in {images_dir}")
+def discover_collections(output_dir: Path) -> list[Path]:
+    """Return all collection folders (subdirs with a frames/ populated)."""
+    if not output_dir.exists():
+        return []
+    return sorted(
+        d for d in output_dir.iterdir()
+        if d.is_dir() and d.name not in SKIP_DIRS and _find_images(d / "frames")
+    )
+
+
+def is_nonseq(collection_dir: Path) -> bool:
+    """A collection is nonseq if a 'nonseq' marker file is present."""
+    return (collection_dir / "nonseq").exists()
+
+
+def extract_video_frames(videos: list[str], output_dir: Path, every_n: int):
+    """Populate seg_data/<stem>/frames/ for each video (skip if already extracted)."""
+    for video_path in videos:
+        name = Path(video_path).stem
+        frames_dir = output_dir / name / "frames"
+        if _find_images(frames_dir):
+            continue
+        frames = extract_frames(video_path, every_n)
+        if not frames:
+            continue
+        save_frames(frames, frames_dir)
+        print(f"  Extracted {name}: {len(frames)} frames")
+
+
+def annotate_collections(output_dir: Path):
+    """Annotate each collection (first frame for seq, every frame for nonseq)."""
+    collections = discover_collections(output_dir)
+    if not collections:
+        print(f"No collections found in {output_dir}")
+        return
+    print(f"\n{len(collections)} collections discovered:")
+    for c in collections:
+        mode = "nonseq" if is_nonseq(c) else "seq"
+        print(f"  {c.name:30s}  [{mode}]  {len(_find_images(c / 'frames'))} frames")
+    print()
+
+    for coll in collections:
+        if is_nonseq(coll):
+            _annotate_nonseq(coll)
+        else:
+            _annotate_seq(coll)
+    cv2.destroyAllWindows()
+
+
+def _annotate_seq(coll: Path):
+    """Annotate the first frame of a sequence collection."""
+    frames_dir = coll / "frames"
+    ann_path = coll / "annotations.json"
+    frame_paths = _find_images(frames_dir)
+    if not frame_paths:
         return
 
-    collection_dir = output_dir / collection_name
-    ann_path = collection_dir / "annotations.json"
+    first_frame = cv2.imread(str(frame_paths[0]))
+    if first_frame is None:
+        print(f"[seq] {coll.name}: cannot read {frame_paths[0].name}")
+        return
+
+    existing = load_annotations(ann_path)
+    status = f"({len(existing)} pts saved)" if existing else "(new)"
+    print(f"[seq] {coll.name} {status}  {len(frame_paths)} frames")
+
+    points = get_click_points(first_frame, existing=existing,
+                              window_name=f"Annotate (seq): {coll.name}")
+    if points is None:
+        print("  Skipped")
+        return
+
+    save_annotations(points, ann_path)
+    fg = sum(1 for _, _, l in points if l == 1)
+    bg = len(points) - fg
+    print(f"  Saved {fg} fg + {bg} bg points")
+
+
+def _annotate_nonseq(coll: Path):
+    """Annotate every frame in a non-sequence collection individually."""
+    frames_dir = coll / "frames"
+    ann_path = coll / "annotations.json"
     ann_by_image = load_image_annotations(ann_path)
 
-    n_done = sum(1 for p in image_paths if p.name in ann_by_image)
-    print(f"Collection: {collection_name}")
-    print(f"Found {len(image_paths)} images ({n_done} already annotated)")
+    frame_paths = _find_images(frames_dir)
+    n_done = sum(1 for p in frame_paths if p.name in ann_by_image)
+    print(f"[nonseq] {coll.name}: {n_done}/{len(frame_paths)} already annotated")
 
-    updated = 0
-    for img_path in image_paths:
+    for img_path in frame_paths:
         frame = cv2.imread(str(img_path))
         if frame is None:
-            print(f"  {img_path.name}: cannot read, skipping")
             continue
-
         existing = ann_by_image.get(img_path.name)
-        status = f"({len(existing)} pts saved)" if existing else "(new)"
-        print(f"\n{img_path.name} {status}")
-
+        status = f"({len(existing)} pts)" if existing else "(new)"
+        print(f"  {img_path.name} {status}")
         points = get_click_points(frame, existing=existing,
-                                  window_name=f"Annotate: {img_path.name}")
+                                  window_name=f"Annotate (nonseq): {coll.name}/{img_path.name}")
         if points is None:
-            print("  Skipped")
+            print("    Skipped")
             continue
-
         ann_by_image[img_path.name] = points
         save_image_annotations(ann_by_image, ann_path)
-        fg = sum(1 for _, _, l in points if l == 1)
-        bg = len(points) - fg
-        print(f"  Saved {fg} fg + {bg} bg points")
-        updated += 1
-
-    cv2.destroyAllWindows()
-    print(f"\nAnnotation done: {updated}/{len(image_paths)} images annotated this run")
 
 
-def process_images(images_dir: Path, output_dir: Path, collection_name: str,
-                   device: str, model_name: str):
-    """Run SAM2 image predictor on all annotated images. Writes frames + masks."""
-    collection_dir = output_dir / collection_name
-    ann_path = collection_dir / "annotations.json"
-    ann_by_image = load_image_annotations(ann_path)
-    if not ann_by_image:
-        print(f"No annotations found at {ann_path}")
+def process_collections(output_dir: Path, device: str, model_name: str):
+    """Generate masks for all annotated collections using the chosen SAM2 variant."""
+    collections = discover_collections(output_dir)
+    seq_todo: list[Path] = []
+    nonseq_todo: list[Path] = []
+
+    for coll in collections:
+        ann_path = coll / "annotations.json"
+        if not ann_path.exists():
+            continue
+        model_masks_dir = coll / "masks" / model_name
+        if model_masks_dir.exists() and list(model_masks_dir.glob("*.png")):
+            print(f"  Skipping {coll.name} ({model_name} masks exist, delete to redo)")
+            continue
+        if is_nonseq(coll):
+            nonseq_todo.append(coll)
+        else:
+            seq_todo.append(coll)
+
+    if not seq_todo and not nonseq_todo:
+        print("Nothing to process (all done or none annotated)")
         return
 
-    image_paths = _find_images(images_dir)
-    model_masks_dir = collection_dir / "masks" / model_name
-    frames_dir = collection_dir / "frames"
+    # Sequence collections: video predictor
+    if seq_todo:
+        print(f"\n{len(seq_todo)} seq collections to process with SAM2-{model_name}. Loading...")
+        predictor = load_sam2(model_name, device)
+        for coll in seq_todo:
+            _process_seq(coll, predictor, output_dir, device, model_name)
 
-    to_process = []
-    for img_path in image_paths:
-        if img_path.name not in ann_by_image:
-            continue
-        out_mask = model_masks_dir / f"{img_path.stem}.png"
-        if out_mask.exists():
-            continue
-        to_process.append(img_path)
+    # Non-sequence collections: image predictor
+    if nonseq_todo:
+        print(f"\n{len(nonseq_todo)} nonseq collections to process with SAM2-{model_name}. Loading...")
+        predictor = load_sam2_image(model_name, device)
+        for coll in nonseq_todo:
+            _process_nonseq(coll, predictor, device, model_name)
 
-    if not to_process:
-        print(f"All annotated images already have {model_name} masks")
+    print("\nProcessing complete!")
+
+
+def _process_seq(coll: Path, predictor, output_dir: Path, device: str, model_name: str):
+    name = coll.name
+    frames_dir = coll / "frames"
+    ann_path = coll / "annotations.json"
+
+    points = load_annotations(ann_path)
+    if not points:
+        print(f"[seq] {name}: no valid annotations, skipping")
+        return
+    frames = load_frames(frames_dir)
+    if not frames:
+        print(f"[seq] {name}: no frames loaded, skipping")
         return
 
-    print(f"{len(to_process)} images to process with SAM2-{model_name}. Loading...")
-    predictor = load_sam2_image(model_name, device)
+    print(f"\n[seq] {name}: propagating {len(points)} points over {len(frames)} frames")
+    tmp_dir = output_dir / "_tmp_sam2_frames"
+    masks = propagate_masks(predictor, frames, points, tmp_dir, device=device)
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
 
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    model_masks_dir = coll / "masks" / model_name
+    count = save_masks(masks, model_masks_dir)
+    print(f"  Saved {count} masks -> masks/{model_name}/")
+
+
+def _process_nonseq(coll: Path, predictor, device: str, model_name: str):
+    name = coll.name
+    frames_dir = coll / "frames"
+    ann_path = coll / "annotations.json"
+    model_masks_dir = coll / "masks" / model_name
     model_masks_dir.mkdir(parents=True, exist_ok=True)
 
+    ann_by_image = load_image_annotations(ann_path)
+    if not ann_by_image:
+        print(f"[nonseq] {name}: no annotations, skipping")
+        return
+
+    print(f"\n[nonseq] {name}: {len(ann_by_image)} annotated frames")
     with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16):
-        for img_path in to_process:
+        saved = 0
+        for fname, pts in ann_by_image.items():
+            mask_path = model_masks_dir / f"{Path(fname).stem}.png"
+            if mask_path.exists():
+                continue
+            img_path = frames_dir / fname
             frame = cv2.imread(str(img_path))
             if frame is None:
                 continue
-
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             predictor.set_image(rgb)
-
-            pts = ann_by_image[img_path.name]
             point_coords = np.array([[x, y] for x, y, _ in pts], dtype=np.float32)
             point_labels = np.array([l for _, _, l in pts], dtype=np.int32)
-
             masks, scores, _ = predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
                 multimask_output=False,
             )
             mask = (masks[0] > 0).astype(np.uint8) * 255
-
-            # Copy source image into frames/ (so train_segmentor.py can find it)
-            shutil.copy2(img_path, frames_dir / f"{img_path.stem}.jpg"
-                         if img_path.suffix.lower() != ".jpg"
-                         else frames_dir / img_path.name)
-            # Write mask
-            cv2.imwrite(str(model_masks_dir / f"{img_path.stem}.png"), mask)
-            print(f"  {img_path.name} -> mask saved (score {scores[0]:.3f})")
-
-    print(f"\nProcessing complete. Masks -> {model_masks_dir}")
+            cv2.imwrite(str(mask_path), mask)
+            saved += 1
+        print(f"  Saved {saved} masks -> masks/{model_name}/")
 
 
-def show_status(videos: list[str], output_dir: Path, video_dir: str):
-    """Show annotation and processing status for all videos."""
-    print(f"  Video dir:  {Path(video_dir).resolve()}")
+def show_status(output_dir: Path, video_dir: str | None):
+    """Show annotation and processing status for all collections in seg_data/."""
     print(f"  Output dir: {output_dir.resolve()}")
+    if video_dir:
+        print(f"  Video dir:  {Path(video_dir).resolve()}")
     print()
 
+    collections = discover_collections(output_dir)
+    if not collections:
+        print("  No collections found.")
+        return
+
+    total_models: dict[str, int] = {}
     annotated = 0
-    total_models = {}
 
-    for video_path in videos:
-        video_name = Path(video_path).stem
-        video_out = output_dir / video_name
-        ann_path = video_out / "annotations.json"
-        frames_dir = video_out / "frames"
-        masks_dir = video_out / "masks"
+    for coll in collections:
+        frames_dir = coll / "frames"
+        ann_path = coll / "annotations.json"
+        masks_dir = coll / "masks"
+        mode = "nonseq" if is_nonseq(coll) else "seq"
 
-        # Annotation status
-        points = load_annotations(ann_path)
-        if points:
-            annotated += 1
-            fg = sum(1 for _, _, l in points if l == 1)
-            bg = len(points) - fg
-            ann_str = f"{fg} fg + {bg} bg pts"
+        n_frames = len(_find_images(frames_dir))
+        frames_str = f"{n_frames} frames"
+
+        if mode == "seq":
+            points = load_annotations(ann_path)
+            if points:
+                annotated += 1
+                fg = sum(1 for _, _, l in points if l == 1)
+                bg = len(points) - fg
+                ann_str = f"{fg} fg + {bg} bg"
+            else:
+                ann_str = "not annotated"
         else:
-            ann_str = "not annotated"
+            ann = load_image_annotations(ann_path)
+            if ann:
+                annotated += 1
+                ann_str = f"{len(ann)}/{n_frames} annotated"
+            else:
+                ann_str = "not annotated"
 
-        # Frames status
-        n_frames = len(list(frames_dir.glob("*.jpg"))) if frames_dir.exists() else 0
-        frames_str = f"{n_frames} frames" if n_frames else "no frames"
-
-        # Model masks status
         models_done = []
         if masks_dir.exists():
             for model_dir in sorted(masks_dir.iterdir()):
@@ -581,10 +605,9 @@ def show_status(videos: list[str], output_dir: Path, video_dir: str):
                         total_models[model_dir.name] = total_models.get(model_dir.name, 0) + 1
         masks_str = ", ".join(models_done) if models_done else "none"
 
-        print(f"  {video_name:20s}  ann: {ann_str:20s}  {frames_str:12s}  masks: {masks_str}")
+        print(f"  {coll.name:30s}  [{mode:6s}]  {frames_str:12s}  ann: {ann_str:22s}  masks: {masks_str}")
 
-    # Summary
-    print(f"\n  Total: {len(videos)} videos, {annotated} annotated")
+    print(f"\n  Total: {len(collections)} collections, {annotated} annotated")
     if total_models:
         model_summary = ", ".join(f"{m}: {c}" for m, c in sorted(total_models.items()))
         print(f"  Masks by model: {model_summary}")
@@ -610,14 +633,11 @@ def main():
 
     parser = argparse.ArgumentParser(description="VIMU v2: SAM2 segmentation annotation")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--video", help="Path to a single video file")
+    group.add_argument("--video", help="Path to a single video file (extracts to seg_data/<stem>/frames/)")
     group.add_argument("--video-dir", default=os.environ.get("VIDEO_DIR"),
-                       help="Directory containing video files")
-    group.add_argument("--images-dir",
-                       help="Directory of still images for segmentor refinement")
-    parser.add_argument("--name", help="Collection name for --images-dir output (default: folder name)")
+                       help="Directory of videos (each extracted to seg_data/<stem>/frames/)")
     parser.add_argument("--output", default=os.environ.get("OUTPUT_DIR", "./seg_data"),
-                        help="Output directory")
+                        help="Output directory (contains collection folders)")
     parser.add_argument("--every-n", type=int,
                         default=int(os.environ.get("EVERY_N", "2")),
                         help="Extract every Nth frame from video (default: 2)")
@@ -630,7 +650,7 @@ def main():
     mode.add_argument("--annotate-only", action="store_true",
                       help="Only annotate, don't run SAM2")
     mode.add_argument("--process-only", action="store_true",
-                      help="Only run SAM2 on already-annotated inputs")
+                      help="Only run SAM2 on already-annotated collections")
     mode.add_argument("--status", action="store_true",
                       help="Show annotation and processing status")
     args = parser.parse_args()
@@ -638,61 +658,30 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Images mode (segmentor refinement) ---
-    if args.images_dir:
-        images_dir = Path(args.images_dir)
-        if not images_dir.exists():
-            parser.error(f"--images-dir not found: {images_dir}")
-        collection_name = args.name or images_dir.name
-        print(f"Images dir:  {images_dir.resolve()}")
-        print(f"Collection:  {collection_name}")
-
-        if args.status:
-            ann_path = output_dir / collection_name / "annotations.json"
-            ann = load_image_annotations(ann_path)
-            n_images = len(_find_images(images_dir))
-            n_annotated = len(ann)
-            print(f"\n  {n_annotated}/{n_images} images annotated")
-            masks_root = output_dir / collection_name / "masks"
-            if masks_root.exists():
-                for model_dir in sorted(masks_root.iterdir()):
-                    if model_dir.is_dir():
-                        n_masks = len(list(model_dir.glob("*.png")))
-                        print(f"  masks/{model_dir.name}: {n_masks}")
-            return
-
-        if args.process_only:
-            process_images(images_dir, output_dir, collection_name, args.device, args.model)
-        elif args.annotate_only:
-            annotate_images(images_dir, output_dir, collection_name)
+    # Optional: extract frames from videos into collection folders
+    if args.video or args.video_dir:
+        if args.video:
+            videos = [args.video]
         else:
-            annotate_images(images_dir, output_dir, collection_name)
-            process_images(images_dir, output_dir, collection_name, args.device, args.model)
-        return
+            video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+            videos = sorted(
+                str(p) for p in Path(args.video_dir).iterdir()
+                if p.suffix.lower() in video_exts
+            )
+        if videos:
+            print(f"Found {len(videos)} video files in {args.video_dir or args.video}")
+            extract_video_frames(videos, output_dir, args.every_n)
 
-    # --- Video mode (default) ---
-    if not args.video and not args.video_dir:
-        parser.error("--video, --video-dir, or --images-dir is required (or set VIDEO_DIR in .env)")
-
-    if args.video:
-        videos = [args.video]
-    else:
-        video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-        videos = sorted(
-            str(p) for p in Path(args.video_dir).iterdir()
-            if p.suffix.lower() in video_exts
-        )
-    print(f"Found {len(videos)} video files")
-
+    # Dispatch action
     if args.status:
-        show_status(videos, output_dir, args.video or args.video_dir)
+        show_status(output_dir, args.video or args.video_dir)
     elif args.process_only:
-        process_videos(videos, output_dir, args.every_n, args.device, args.model)
+        process_collections(output_dir, args.device, args.model)
     elif args.annotate_only:
-        annotate_videos(videos, output_dir)
+        annotate_collections(output_dir)
     else:
-        annotate_videos(videos, output_dir)
-        process_videos(videos, output_dir, args.every_n, args.device, args.model)
+        annotate_collections(output_dir)
+        process_collections(output_dir, args.device, args.model)
 
 
 if __name__ == "__main__":

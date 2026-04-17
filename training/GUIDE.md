@@ -260,21 +260,38 @@ You can also pass a direct checkpoint with `--seg-model /path/to/vimu_seg.pt` if
 
 ### Segmentor Refinement (optional)
 
-If the segmentor misses the robot or includes wrong objects in some frames, you can refine it with just those frames without redoing any video annotation:
+Every subfolder of `seg_data/` that has a `frames/` directory is treated as a "collection". The unified annotation script picks up any collection automatically -- whether it came from a video (extracted via `--video-dir`) or was created manually. To refine the segmentor, you just create a new collection and run the same annotation pipeline.
 
-1. Copy problem frames from `raw/` to a new folder, e.g. `refinement_v1/`
-2. Annotate each image individually with positive/negative points (same UI as Phase 1):
-   ```bash
-   python annotate_seg.py --images-dir ./refinement_v1/ --annotate-only
-   python annotate_seg.py --images-dir ./refinement_v1/ --process-only
-   ```
-   Output goes to `seg_data/refinement_v1/frames/` + `masks/<model>/`, compatible with the training script.
-3. Finetune from your existing variant so the model preserves what it already learned:
-   ```bash
-   python train_segmentor.py --variant sparse_large_v2 --from-variant sparse_large_v1
-   ```
-   The training picks up both the original video-derived data and the new `refinement_v1/` images automatically.
-4. Verify with `test_segmentor.py --variant sparse_large_v2` and iterate if needed.
+**Sequence mode (default)** -- annotate the first frame, SAM2 propagates through all frames. Best when the whole sequence has a consistent error (e.g. a fixed camera angle where SAM2 picks up the same wrong background object).
+
+```bash
+# Manually create a collection from the raw frames saved during pose collection
+mkdir -p seg_data/refinement_v1/frames/
+cp <pose_dir>/<variant>/raw/*.jpg seg_data/refinement_v1/frames/
+
+# Run the same pipeline -- it finds and annotates any new un-annotated collections
+python annotate_seg.py
+```
+
+**Non-sequence mode** -- annotate every frame individually with SAM2's image predictor. Use this when problem frames are scattered (not a coherent sequence) and a single annotation wouldn't propagate well. Mark a collection as non-sequence by dropping an empty `nonseq` file in its folder:
+
+```bash
+mkdir -p seg_data/refinement_v2/frames/
+cp .../bad_frame_*.jpg seg_data/refinement_v2/frames/
+touch seg_data/refinement_v2/nonseq
+
+python annotate_seg.py
+```
+
+Either way the output lands in `seg_data/<name>/masks/<model>/`, compatible with the training script.
+
+Then finetune from your existing variant so the model preserves what it already learned:
+
+```bash
+python train_segmentor.py --variant sparse_large_v2 --from-variant sparse_large_v1
+```
+
+Training picks up every collection in `seg_data/` with matching masks automatically. Verify with `test_segmentor.py --variant sparse_large_v2` and iterate if needed.
 
 ## Phase 4: Train Pose Model
 
