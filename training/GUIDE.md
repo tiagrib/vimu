@@ -229,7 +229,7 @@ This opens a camera window with a green overlay on the detected robot and an FPS
 
 ## Phase 3: Collect Pose Data
 
-Start the controller, then collect from multiple camera angles:
+Start the controller, then collect from multiple camera angles. Use the segmentor `--variant` you validated in Phase 2:
 
 ```bash
 # Terminal 1: start controller
@@ -240,19 +240,21 @@ cargo run --release -p adelino-standalone -- run --port COM3 --calibration calib
 cd vimu/training/
 
 # First angle
-python collect_pose.py sweep \
-    --calibration ../../projects/adelino/target/release/calibration.toml \
-    --seg-model vimu_seg.pt \
-    --camera 0 --num-poses 500
+python collect_pose.py sweep \ 
+    --variant sparse_large_yolo26
+    --calibration ../../projects/adelino/target/release/calibration.toml --camera 1 --resolution 1920x1080 \ 
+    --num-poses 500 --settle 2.0 --max-delta 0.03
 
 # Move tripod, then append from a new angle
-python collect_pose.py sweep \
-    --calibration ../../projects/adelino/target/release/calibration.toml \
-    --seg-model vimu_seg.pt \
-    --camera 0 --num-poses 500 --append
+python collect_pose.py sweep \ 
+    --variant sparse_large_yolo26
+    --calibration ../../projects/adelino/target/release/calibration.toml --camera 1 --resolution 1920x1080 \ 
+    --num-poses 500 --settle 2.0 --max-delta 0.03 --append
 ```
 
 Repeat from 3-5 different camera positions. The segmentor strips backgrounds live, so the pose model trains on clean masked images.
+
+You can also pass a direct checkpoint with `--seg-model /path/to/vimu_seg.pt` if you want to test one outside the standard `models/` layout.
 
 ## Phase 4: Train Pose Model
 
@@ -306,7 +308,7 @@ python test_segmentor.py --variant my_variant
 python train_segmentor.py --list                    # see all variants
 
 # Phase 3: Collect pose data (~5 min per angle, repeat 3-5 times)
-python collect_pose.py sweep --calibration calibration.toml --seg-model vimu_seg.pt --camera 0 --num-poses 500
+python collect_pose.py sweep --variant my_variant --calibration calibration.toml --num-poses 500
 
 # Phase 4: Train pose model (~20 min with GPU)
 python train.py --data ./pose_data --epochs 100

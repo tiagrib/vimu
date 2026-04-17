@@ -11,31 +11,22 @@ Requires:
     - A trained YOLO segmentor (vimu_seg.pt from Phase 2)
 
 Usage:
-    # First camera angle
-    python collect_pose.py \
-        --calibration ../../projects/adelino/target/release/calibration.toml \
-        --seg-model vimu_seg.pt \
-        --ws ws://localhost:8765 \
-        --camera 0 \
-        --num-poses 500 \
-        --output-dir ./pose_data
+    # First camera angle (configure defaults in .env)
+    python collect_pose.py sweep \
+        --variant sparse_large_v1 \
+        --calibration /path/to/calibration.toml \
+        --num-poses 500
 
     # Move tripod to a different angle, then append
-    python collect_pose.py \
-        --calibration ../../projects/adelino/target/release/calibration.toml \
-        --seg-model vimu_seg.pt \
-        --ws ws://localhost:8765 \
-        --camera 0 \
-        --num-poses 500 \
-        --output-dir ./pose_data \
-        --append
+    python collect_pose.py sweep \
+        --variant sparse_large_v1 \
+        --calibration /path/to/calibration.toml \
+        --num-poses 500 --append
 
     # Tilted base collection (manual)
     python collect_pose.py tilted \
-        --calibration ../../projects/adelino/target/release/calibration.toml \
-        --seg-model vimu_seg.pt \
-        --camera 0 \
-        --output-dir ./pose_data
+        --variant sparse_large_v1 \
+        --calibration /path/to/calibration.toml
 
 Output:
     pose_data/
@@ -48,14 +39,69 @@ import csv
 import json
 import os
 import time
+from pathlib import Path
 
-import cv2
-import numpy as np
+os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
 
 try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib
+
+from model_paths import get_model_path, list_variants, get_models_dir  # noqa: E402
+
+
+def load_dotenv():
+    """Load .env file from the script's directory if it exists."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def resolve_seg_model(args) -> Path:
+    """Resolve segmentor model path from --variant or --seg-model."""
+    if getattr(args, "seg_model", None):
+        p = Path(args.seg_model)
+        if not p.exists():
+            print(f"ERROR: Segmentor file not found: {p}")
+            raise SystemExit(1)
+        return p
+
+    variant = getattr(args, "variant", None)
+    models_dir = getattr(args, "models_dir", None)
+
+    if variant:
+        p = get_model_path("segmentation", variant, "vimu_seg.pt", models_dir)
+        if not p.exists():
+            print(f"ERROR: No vimu_seg.pt found for variant '{variant}'")
+            print(f"  Expected: {p}")
+            variants = list_variants("segmentation", models_dir)
+            if variants:
+                print(f"  Available variants: {', '.join(variants)}")
+            raise SystemExit(1)
+        return p
+
+    variants = list_variants("segmentation", models_dir)
+    models_dir_path = get_models_dir(models_dir)
+    if variants:
+        print(f"Available segmentation variants ({models_dir_path.resolve()}):")
+        for v in variants:
+            print(f"  --variant {v}")
+    else:
+        print(f"No segmentation variants found in {models_dir_path.resolve()}")
+    print("\nSpecify --variant <name> or --seg-model <path>")
+    raise SystemExit(1)
 
 
 # ─── Calibration loader ─────────────────────────────────────────────────────
@@ -152,24 +198,101 @@ class WebSocketController:
 
 # ─── Pose generation ─────────────────────────────────────────────────────────
 
-def generate_poses(joint_ranges: list[dict], num_poses: int, seed: int = 42) -> list:
+def generate_poses(
+    joint_ranges: list[dict],
+    num_poses: int,
+    walk_delta: float = 0.2,
+    reset_every: int = 25,
+    seed: int = 42,
+) -> list:
+    """Generate a sequence of poses via random walk with occasional full-random resets.
+
+    Each successive pose changes by at most ``walk_delta`` per joint (clipped to the
+    joint's calibrated range). Every ``reset_every`` poses the walk jumps to a fresh
+    fully-random pose to ensure coverage across the joint space.
+    """
     rng = np.random.default_rng(seed)
     poses = []
-    for _ in range(num_poses):
-        pose = [rng.uniform(j["min_rad"], j["max_rad"]) for j in joint_ranges]
+    current = [0.0] * len(joint_ranges)
+    for i in range(num_poses):
+        if i % reset_every == 0:
+            pose = [rng.uniform(j["min_rad"], j["max_rad"]) for j in joint_ranges]
+        else:
+            pose = []
+            for c, j in zip(current, joint_ranges):
+                step = rng.uniform(-walk_delta, walk_delta)
+                pose.append(float(np.clip(c + step, j["min_rad"], j["max_rad"])))
         poses.append(pose)
+        current = pose
     return poses
+
+
+def interpolate_to(
+    controller,
+    current: list[float],
+    target: list[float],
+    max_delta: float,
+    rate_hz: float,
+) -> list[float]:
+    """Send interpolated commands from current to target, limited to max_delta per step.
+
+    Returns the final pose (== target).
+    """
+    dt = 1.0 / rate_hz
+    pos = list(current)
+    while True:
+        remaining = [t - p for t, p in zip(target, pos)]
+        max_remaining = max(abs(r) for r in remaining)
+        if max_remaining <= max_delta:
+            controller.set_angles(target)
+            time.sleep(dt)
+            return list(target)
+        # Take a step of at most max_delta on the largest-moving joint
+        scale = max_delta / max_remaining
+        pos = [p + r * scale for p, r in zip(pos, remaining)]
+        controller.set_angles(pos)
+        time.sleep(dt)
 
 
 # ─── Sweep collection ────────────────────────────────────────────────────────
 
+def resolve_pose_data_dir(args) -> str:
+    """Resolve the effective pose data directory: <output-dir>/<variant>."""
+    base = args.output_dir
+    variant = getattr(args, "variant", None)
+    if variant:
+        return os.path.join(base, variant)
+    # Fall back to the raw output-dir when a direct --seg-model path is used
+    return base
+
+
+def open_camera(args):
+    """Open the camera with requested resolution/fps (DirectShow + MJPG)."""
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera {args.camera}")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    rw, rh = (int(x) for x in args.resolution.split("x"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
+    if getattr(args, "fps", 0) and args.fps > 0:
+        cap.set(cv2.CAP_PROP_FPS, args.fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    print(f"Camera: {actual_w}x{actual_h} @ {actual_fps:.0f} fps")
+    return cap
+
+
 def collect_sweep(args, joint_ranges: list[dict]):
     num_joints = len(joint_ranges)
 
-    # Find start index for appending
-    masked_dir = os.path.join(args.output_dir, "masked")
+    pose_dir = resolve_pose_data_dir(args)
+    masked_dir = os.path.join(pose_dir, "masked")
     os.makedirs(masked_dir, exist_ok=True)
-    labels_path = os.path.join(args.output_dir, "labels.csv")
+    labels_path = os.path.join(pose_dir, "labels.csv")
+    print(f"Pose data dir: {os.path.abspath(pose_dir)}")
 
     start_idx = 0
     if args.append and os.path.exists(masked_dir):
@@ -177,30 +300,40 @@ def collect_sweep(args, joint_ranges: list[dict]):
         if existing:
             start_idx = max(int(os.path.splitext(f)[0]) for f in existing) + 1
 
-    # Open camera
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera {args.camera}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap = open_camera(args)
 
     # Load segmentor
-    print(f"Loading segmentor from {args.seg_model}...")
-    seg = YoloSegmentor(args.seg_model)
+    seg_path = resolve_seg_model(args)
+    print(f"Loading segmentor from {seg_path}...")
+    seg = YoloSegmentor(str(seg_path))
 
     # Open controller
     controller = WebSocketController(args.ws, num_joints)
 
     # Generate poses (offset seed by start_idx for variety on append)
-    poses = generate_poses(joint_ranges, args.num_poses, seed=args.seed + start_idx)
+    poses = generate_poses(
+        joint_ranges,
+        args.num_poses,
+        walk_delta=args.walk_delta,
+        reset_every=args.reset_every,
+        seed=args.seed + start_idx,
+    )
 
-    print(f"Collecting {len(poses)} poses for {num_joints} joints, settle time {args.settle}s")
+    print(f"Collecting {len(poses)} poses for {num_joints} joints")
+    print(f"  motion: max-delta {args.max_delta} rad/step @ {args.rate}Hz, settle {args.settle}s")
+    print(f"  walk: delta {args.walk_delta} rad/pose, reset every {args.reset_every} poses")
     print(f"Joint ranges:")
     for j in joint_ranges:
         print(f"  {j['name']}: [{j['min_rad']:.3f}, {j['max_rad']:.3f}] rad")
     print(f"Starting at index {start_idx}")
-    print(f"Estimated time: {len(poses) * args.settle / 60:.1f} minutes")
+
+    # Move to neutral (all zeros) before starting, using interpolation from unknown position
+    neutral = [0.0] * num_joints
+    print("Moving to neutral pose before starting...")
+    # We don't know the starting position, so send neutral directly and wait.
+    controller.set_angles(neutral)
+    time.sleep(max(args.settle, 1.0))
+    current_pose = list(neutral)
 
     # CSV setup
     joint_cols = [f"joint_{i+1}" for i in range(num_joints)]
@@ -219,13 +352,13 @@ def collect_sweep(args, joint_ranges: list[dict]):
             for i, pose in enumerate(poses):
                 idx = start_idx + i
 
-                ok = controller.set_angles(pose)
-                if not ok:
-                    time.sleep(0.1)
-                    ok = controller.set_angles(pose)
-                    if not ok:
-                        print(f"  Skipping pose {idx}")
-                        continue
+                try:
+                    current_pose = interpolate_to(
+                        controller, current_pose, pose, args.max_delta, args.rate
+                    )
+                except Exception as e:
+                    print(f"  Interpolation failed at pose {idx}: {e}")
+                    continue
 
                 time.sleep(args.settle)
 
@@ -268,32 +401,42 @@ def collect_sweep(args, joint_ranges: list[dict]):
                     break
 
     finally:
+        # Return to neutral before disconnecting
+        print("Returning to neutral pose...")
+        try:
+            interpolate_to(
+                controller, current_pose, [0.0] * num_joints, args.max_delta, args.rate
+            )
+            time.sleep(max(args.settle, 1.0))
+        except Exception:
+            pass
         controller.close()
         cap.release()
         cv2.destroyAllWindows()
 
-    print(f"\nDone! Collected {collected} masked frames -> {args.output_dir}")
-    print(f"Next step: python train.py --data {args.output_dir} --num-joints {num_joints}")
+    print(f"\nDone! Collected {collected} masked frames -> {pose_dir}")
+    print(f"Next step: python train.py --data {pose_dir} --num-joints {num_joints}")
 
 
 # ─── Tilted base collection ──────────────────────────────────────────────────
 
 def collect_tilted(args, joint_ranges: list[dict]):
     num_joints = len(joint_ranges)
-    masked_dir = os.path.join(args.output_dir, "masked")
+    pose_dir = resolve_pose_data_dir(args)
+    masked_dir = os.path.join(pose_dir, "masked")
     os.makedirs(masked_dir, exist_ok=True)
+    print(f"Pose data dir: {os.path.abspath(pose_dir)}")
 
-    cap = cv2.VideoCapture(args.camera)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap = open_camera(args)
 
-    print(f"Loading segmentor from {args.seg_model}...")
-    seg = YoloSegmentor(args.seg_model)
+    seg_path = resolve_seg_model(args)
+    print(f"Loading segmentor from {seg_path}...")
+    seg = YoloSegmentor(str(seg_path))
 
     existing = [f for f in os.listdir(masked_dir) if f.endswith(".jpg")] if os.path.exists(masked_dir) else []
     start_idx = max((int(os.path.splitext(f)[0]) for f in existing), default=-1) + 1
 
-    labels_path = os.path.join(args.output_dir, "labels.csv")
+    labels_path = os.path.join(pose_dir, "labels.csv")
     file_exists = os.path.exists(labels_path)
 
     print("\n=== Tilted Base Collection ===")
@@ -351,32 +494,48 @@ def collect_tilted(args, joint_ranges: list[dict]):
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
+def add_common_args(p):
+    """Arguments shared between sweep and tilted modes."""
+    p.add_argument("--variant", help="Segmentation model variant name")
+    p.add_argument("--seg-model", help="Direct path to YOLO checkpoint (overrides --variant)")
+    p.add_argument("--models-dir", default=None, help="Override models directory")
+    p.add_argument("--calibration", required=True,
+                   help="Path to calibration TOML (from adelino-standalone calibrate)")
+    p.add_argument("--camera", type=int, default=0)
+    p.add_argument("--resolution", default="640x480", help="Camera resolution WxH (default: 640x480)")
+    p.add_argument("--fps", type=float, default=0, help="Camera capture FPS (0 = max supported)")
+    p.add_argument("--output-dir", default=os.environ.get("POSE_DATA_DIR", "./pose_data"))
+
+
 def main():
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="VIMU v2: Pose data collection with live segmentation")
     sub = parser.add_subparsers(dest="mode", required=True)
 
     # Sweep mode
     sweep = sub.add_parser("sweep", help="Automated random pose sweep")
-    sweep.add_argument("--calibration", required=True,
-                       help="Path to calibration TOML (from adelino-standalone calibrate)")
-    sweep.add_argument("--seg-model", required=True, help="Path to trained YOLO segmentor (vimu_seg.pt)")
-    sweep.add_argument("--ws", default="ws://localhost:8765",
+    add_common_args(sweep)
+    sweep.add_argument("--ws", default=os.environ.get("CONTROLLER_WS", "ws://localhost:8765"),
                        help="WebSocket URL of robot controller (default: ws://localhost:8765)")
-    sweep.add_argument("--camera", type=int, default=0)
     sweep.add_argument("--num-poses", type=int, default=500)
-    sweep.add_argument("--settle", type=float, default=0.6)
-    sweep.add_argument("--output-dir", default="./pose_data")
+    sweep.add_argument("--settle", type=float, default=0.2,
+                       help="Seconds to wait after arriving at a pose before capture (default: 0.2)")
+    sweep.add_argument("--max-delta", type=float, default=0.05,
+                       help="Max per-joint change per interpolation sub-step in rad (default: 0.05)")
+    sweep.add_argument("--rate", type=float, default=30.0,
+                       help="Interpolation command rate in Hz (default: 30)")
+    sweep.add_argument("--walk-delta", type=float, default=0.2,
+                       help="Max per-joint change between captured poses in rad (default: 0.2)")
+    sweep.add_argument("--reset-every", type=int, default=25,
+                       help="Jump to a fresh random pose every N poses (default: 25)")
     sweep.add_argument("--seed", type=int, default=42)
     sweep.add_argument("--append", action="store_true",
                        help="Append to existing dataset (for multi-angle collection)")
 
     # Tilted mode
     tilted = sub.add_parser("tilted", help="Manual tilted base capture")
-    tilted.add_argument("--calibration", required=True,
-                        help="Path to calibration TOML (from adelino-standalone calibrate)")
-    tilted.add_argument("--seg-model", required=True, help="Path to trained YOLO segmentor (vimu_seg.pt)")
-    tilted.add_argument("--camera", type=int, default=0)
-    tilted.add_argument("--output-dir", default="./pose_data")
+    add_common_args(tilted)
 
     args = parser.parse_args()
     joint_ranges = load_calibration(args.calibration)
